@@ -35,6 +35,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Workdir is where manage.py will be
 WORKDIR /backend
 
+#Allows for the use of breakpoints with VS Code
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+RUN pip install --no-cache-dir debugpy
+
 # Install deps early to leverage layer caching
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
