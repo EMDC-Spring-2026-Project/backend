@@ -100,58 +100,9 @@ def assign_judge_to_contest(request):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Check if judge is already assigned to another cluster of the same type WITHIN THIS CONTEST
-        # A judge can only be assigned to:
-        # - 1 preliminary cluster per contest
-        # - 1 championship cluster per contest
-        # - 1 redesign cluster per contest
-        
-        # Get all clusters that belong to this contest
-        from ...models import MapContestToCluster
-        contest_cluster_ids = MapContestToCluster.objects.filter(
-            contestid=contest_id
-        ).values_list('clusterid', flat=True)
-        
-        # Get all clusters the judge is assigned to
-        judge_cluster_ids = MapJudgeToCluster.objects.filter(
-            judgeid=judge_id
-        ).values_list('clusterid', flat=True)
-        
-        # Find clusters that belong to THIS contest AND the judge is assigned to
-        # (intersection of contest clusters and judge clusters)
-        judge_contest_cluster_ids = set(contest_cluster_ids) & set(judge_cluster_ids)
-        
-        # Check if judge already has a cluster of the same type in this contest
-        existing_clusters_of_same_type = []
-        for existing_cluster_id in judge_contest_cluster_ids:
-            if existing_cluster_id == cluster_id:
-                continue  # Skip the cluster we're trying to assign to
-            try:
-                existing_cluster = JudgeClusters.objects.get(id=existing_cluster_id)
-                existing_cluster_type = getattr(existing_cluster, 'cluster_type', None)
-                # Fallback to checking cluster name
-                if not existing_cluster_type:
-                    if 'championship' in existing_cluster.cluster_name.lower():
-                        existing_cluster_type = 'championship'
-                    elif 'redesign' in existing_cluster.cluster_name.lower():
-                        existing_cluster_type = 'redesign'
-                    else:
-                        existing_cluster_type = 'preliminary'
-                
-                # Check if this existing cluster has the same type as the one we're trying to assign
-                if existing_cluster_type == cluster_type:
-                    existing_clusters_of_same_type.append(existing_cluster.cluster_name)
-            except JudgeClusters.DoesNotExist:
-                continue
-        
-        if existing_clusters_of_same_type:
-            cluster_names = ', '.join(existing_clusters_of_same_type)
-            cluster_type_label = cluster_type.capitalize()
-            return Response(
-                {"error": f"Judge {judge.first_name} {judge.last_name} is already assigned to {cluster_type_label} cluster(s) in this contest: {cluster_names}. A judge can only be assigned to one {cluster_type_label} cluster per contest."}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
+        # Judges can now be assigned to multiple clusters of any type
+        # (previously there was a restriction limiting to 1 cluster per type per contest)
+
         # Create the contest-judge mapping (only if not already exists)
         if not existing_contest_mapping:
             mapping_data = {
