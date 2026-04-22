@@ -71,14 +71,21 @@ def create_judge(request):
             if not role_mapping:
                 raise ValidationError('Failed to create judge role mapping.')
 
-            responses = [role_mapping,
-                create_contest_to_judge_map({
-                    "contestid": request.data["contestid"],
-                    "judgeid": judge_response.get("id")
-                }),
-                map_cluster_to_judge({
-                    "judgeid": judge_response.get("id"),
-                    "clusterid": request.data["clusterid"],
+            contest_mapping = create_contest_to_judge_map({
+                "contestid": request.data["contestid"],
+                "judgeid": judge_response.get("id")
+            })
+            if isinstance(contest_mapping, Response):
+                return contest_mapping
+
+            # Support both single clusterid and multiple clusterids
+            cluster_entries = request.data.get("clusterids")
+            if cluster_entries and isinstance(cluster_entries, list):
+                cluster_payloads = cluster_entries
+            else:
+                # Backward compatibility: single clusterid
+                cluster_payloads = [{
+                    "clusterid": request.data.get("clusterid"),
                     "presentation": request.data.get("presentation", False),
                     "journal": request.data.get("journal", False),
                     "mdo": request.data.get("mdo", False),
@@ -86,33 +93,58 @@ def create_judge(request):
                     "otherpenalties": request.data.get("otherpenalties", False),
                     "redesign": request.data.get("redesign", False),
                     "championship": request.data.get("championship", False),
-                }),
-                
-                create_sheets_for_teams_in_cluster(
-                    judge_response.get("id"),
-                    request.data["clusterid"],
-                    request.data["presentation"],
-                    request.data["journal"],
-                    request.data["mdo"],
-                    request.data["runpenalties"],
-                    request.data["otherpenalties"],
-                    request.data.get("redesign"),
-                    request.data.get("championship"),
-                )
-            ]
+                }]
 
-            # Check for any errors in mapping responses
-            for response in responses:
-                if isinstance(response, Response):
-                    return response
+            # Process each cluster
+            cluster_mappings = []
+            score_sheets_list = []
+
+            for payload in cluster_payloads:
+                cluster_id = payload.get("clusterid")
+                if not cluster_id:
+                    continue
+
+                cluster_mapping = map_cluster_to_judge({
+                    "judgeid": judge_response.get("id"),
+                    "clusterid": cluster_id,
+                    "presentation": payload.get("presentation", False),
+                    "journal": payload.get("journal", False),
+                    "mdo": payload.get("mdo", False),
+                    "runpenalties": payload.get("runpenalties", False),
+                    "otherpenalties": payload.get("otherpenalties", False),
+                    "redesign": payload.get("redesign", False),
+                    "championship": payload.get("championship", False),
+                })
+
+                if isinstance(cluster_mapping, Response):
+                    return cluster_mapping
+
+                cluster_mappings.append(cluster_mapping)
+
+                score_sheets = create_sheets_for_teams_in_cluster(
+                    judge_response.get("id"),
+                    cluster_id,
+                    payload.get("presentation", False),
+                    payload.get("journal", False),
+                    payload.get("mdo", False),
+                    payload.get("runpenalties", False),
+                    payload.get("otherpenalties", False),
+                    payload.get("redesign", False),
+                    payload.get("championship", False),
+                )
+
+                if isinstance(score_sheets, Response):
+                    return score_sheets
+
+                score_sheets_list.append(score_sheets)
 
             return Response({
                 "user": user_response,
                 "judge": judge_response,
-                "user_map": responses[0],
-                "contest_map": responses[1],
-                "cluster_map": responses[2],
-                "score_sheets": responses[3]
+                "user_map": role_mapping,
+                "contest_map": contest_mapping,
+                "cluster_maps": cluster_mappings,
+                "score_sheets": score_sheets_list
             }, status=status.HTTP_201_CREATED)
 
     except ValidationError as e:

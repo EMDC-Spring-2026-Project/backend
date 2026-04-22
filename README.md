@@ -62,15 +62,29 @@ python manage.py makemigrations emdcbackend
 python manage.py migrate emdcbackend
 ```
 
+### 6. Create Superuser (Optional)
+
+```bash
+python manage.py createsuperuser
+```
+
 ## Running the Server
 
 ### Development Server
 
 ```bash
-python manage.py runserver 7004
+python manage.py runserver
 ```
 
-The server will be available at `http://127.0.0.1:7004/`
+The server will be available at `http://127.0.0.1:8000/`
+
+### Production Server
+
+For production, use a WSGI server like Gunicorn:
+
+```bash
+gunicorn emdcbackend.wsgi:application
+```
 
 ## API Documentation
 
@@ -238,4 +252,18 @@ The following environment variables can be configured:
 - Password hashing
 - Shared password support for Organizer/Judge roles
 
+## Contributing
 
+1. Create a feature branch
+2. Make your changes
+3. Add tests for new functionality
+4. Ensure all tests pass
+5. Submit a pull request
+
+## License
+
+[Your License Here]
+
+## Support
+
+For issues and questions, please contact [your contact information].

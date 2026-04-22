@@ -13,6 +13,7 @@ from django.db import transaction
 from ..serializers import AdminSerializer
 from ..models import Admin
 from ..auth.views import create_user
+from ..auth.views import delete_user
 from .Maps.MapUserToRole import create_user_role_map
 from ..models import MapUserToRole
 from ..auth.views import User, delete_user_by_id
@@ -121,6 +122,7 @@ def edit_admin(request):
     serializer = AdminSerializer(instance=admin)
     return Response({"Admin": serializer.data}, status=status.HTTP_200_OK)
 
+
 # delete an admin by a certain id
 @api_view(["DELETE"])
 @authentication_classes([SessionAuthentication])
@@ -128,11 +130,11 @@ def edit_admin(request):
 def delete_admin(request, admin_id):
     try:
         admin = get_object_or_404(Admin, id=admin_id)
-        admin_mapping = MapUserToRole.objects.get(role=MapUserToRole.RoleEnum.ADMIN, adminid=admin_id)
-        user_id = admin_mapping.userid
+        admin_mapping = MapUserToRole.objects.get(role=MapUserToRole.RoleEnum.ADMIN, relatedid=admin_id)
+        user_id = admin_mapping.uuid
         admin.delete()
         admin_mapping.delete()
-        delete_user_by_id(request, user_id)
+        delete_user(user_id)
         return Response({"Detail": "Admin deleted successfully."}, status=status.HTTP_200_OK)
     except Admin.DoesNotExist:
         return Response({"error": "Admin not found."}, status=status.HTTP_404_NOT_FOUND)
