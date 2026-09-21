@@ -131,6 +131,29 @@ class MappingAPITests(APITestCase):
         self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_201_CREATED])
         self.assertTrue(MapContestToOrganizer.objects.filter(contestid=self.contest.id, organizerid=self.organizer.id).exists())
 
+    def test_unprivileged_user_cannot_change_contest_assignments(self):
+        unprivileged_user = User.objects.create_user(
+            username="unprivileged@example.com", password="testpassword"
+        )
+        self.client.force_authenticate(user=unprivileged_user)
+
+        judge_response = self.client.post(
+            reverse('create_contest_judge_mapping'),
+            {"contestid": self.contest.id, "judgeid": self.judge.id},
+        )
+        team_response = self.client.post(
+            reverse('create_contest_team_mapping'),
+            {"contestid": self.contest.id, "teamid": self.team.id},
+        )
+        organizer_response = self.client.post(
+            reverse('create_contest_organizer_mapping'),
+            {"contestid": self.contest.id, "organizerid": self.organizer.id},
+        )
+
+        self.assertEqual(judge_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(team_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(organizer_response.status_code, status.HTTP_403_FORBIDDEN)
+
     def test_get_organizers_by_contest_id(self):
         MapContestToOrganizer.objects.create(contestid=self.contest.id, organizerid=self.organizer.id)
         url = reverse('get_organizers_by_contest_id', args=[self.contest.id])
@@ -427,4 +450,3 @@ class MappingAPITests(APITestCase):
         url = reverse('all_submitted_for_team', args=[self.team.id])
         response = self.client.get(url)
         self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR])
-

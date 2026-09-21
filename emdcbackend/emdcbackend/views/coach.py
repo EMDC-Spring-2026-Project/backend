@@ -18,6 +18,18 @@ from ..auth.views import User, delete_user
 from ..auth.password_utils import send_set_password_email
 from django.contrib.sessions.models import Session
 
+
+def _is_admin(user):
+    return user.is_superuser or MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+    ).exists()
+
+
+def _can_edit_coach(user, coach_id):
+    return _is_admin(user) or MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.COACH, relatedid=coach_id
+    ).exists()
+
 @api_view(["GET"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -38,6 +50,8 @@ def coach_get_all(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def create_coach(request):
+    if not _is_admin(request.user):
+        return Response({"detail": "Administrator access required."}, status=status.HTTP_403_FORBIDDEN)
     serializer = CoachSerializer(data=request.data)
     if serializer.is_valid():
         serializer.save()
@@ -51,6 +65,8 @@ def create_coach(request):
 @permission_classes([IsAuthenticated])
 def edit_coach(request):
     coach = get_object_or_404(Coach, id=request.data["id"])
+    if not _can_edit_coach(request.user, coach.id):
+        return Response({"detail": "You cannot edit this coach profile."}, status=status.HTTP_403_FORBIDDEN)
     coach.first_name = request.data["first_name"]
     coach.last_name = request.data["last_name"]
     coach.school_name = request.data["school_name"]
@@ -78,6 +94,8 @@ def _delete_user_sessions(user_id: int) -> None:
 @permission_classes([IsAuthenticated])
 def delete_coach(request, coach_id):
     try:
+        if not _is_admin(request.user):
+            return Response({"detail": "Administrator access required."}, status=status.HTTP_403_FORBIDDEN)
         coach = get_object_or_404(Coach, id=coach_id)
         coach_mapping = MapUserToRole.objects.get(role=MapUserToRole.RoleEnum.COACH, relatedid=coach_id)
         user_id = coach_mapping.uuid
@@ -159,4 +177,3 @@ def get_coach(coach_id):
     coach = get_object_or_404(Coach, id = coach_id)
     serializer = CoachSerializer(instance=coach)
     return serializer.data
-

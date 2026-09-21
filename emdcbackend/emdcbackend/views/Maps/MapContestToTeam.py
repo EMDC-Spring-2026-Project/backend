@@ -10,13 +10,28 @@ from rest_framework.response import Response
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from django.shortcuts import get_object_or_404
-from ...models import MapContestToTeam, Contest, Teams, MapUserToRole
+from ...models import MapContestToTeam, Contest, Teams, MapContestToOrganizer, MapUserToRole
 from ...serializers import MapContestToTeamSerializer, ContestSerializer, TeamSerializer
+
+
+def _can_manage_contest(user, contest_id):
+  if user.is_superuser or MapUserToRole.objects.filter(
+      uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+  ).exists():
+      return True
+  organizer_ids = MapUserToRole.objects.filter(
+      uuid=user.id, role=MapUserToRole.RoleEnum.ORGANIZER
+  ).values_list("relatedid", flat=True)
+  return MapContestToOrganizer.objects.filter(
+      contestid=contest_id, organizerid__in=organizer_ids
+  ).exists()
 
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def create_contest_team_mapping(request):
+  if not _can_manage_contest(request.user, request.data.get("contestid")):
+      return Response({"detail": "You cannot manage this contest."}, status=status.HTTP_403_FORBIDDEN)
   serializer = MapContestToTeamSerializer(data=request.data)
   if serializer.is_valid():
       serializer.save()
@@ -95,6 +110,8 @@ def get_contests_by_team_ids(request):
 @permission_classes([IsAuthenticated])
 def delete_contest_team_mapping_by_id(request, map_id):
     map_to_delete = get_object_or_404(MapContestToTeam, id=map_id)
+    if not _can_manage_contest(request.user, map_to_delete.contestid):
+        return Response({"detail": "You cannot manage this contest."}, status=status.HTTP_403_FORBIDDEN)
     map_to_delete.delete()
     return Response({"detail": "Contest To Team Mapping deleted successfully."}, status=status.HTTP_200_OK)
 

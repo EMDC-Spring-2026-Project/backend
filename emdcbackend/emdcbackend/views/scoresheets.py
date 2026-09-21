@@ -10,12 +10,44 @@ from rest_framework.permissions import IsAuthenticated
 from django.shortcuts import get_object_or_404
 from rest_framework.exceptions import ValidationError
 from .Maps.MapScoreSheet import delete_score_sheet_mapping
-from ..models import Scoresheet, Teams, Judge, MapClusterToTeam, MapScoresheetToTeamJudge, MapJudgeToCluster, ScoresheetEnum, Contest, MapContestToTeam, MapContestToCluster
+from ..models import Scoresheet, Teams, Judge, MapClusterToTeam, MapScoresheetToTeamJudge, MapJudgeToCluster, ScoresheetEnum, Contest, MapContestToTeam, MapContestToCluster, MapContestToOrganizer, MapUserToRole
 from ..serializers import ScoresheetSerializer, MapScoreSheetToTeamJudgeSerializer
 
+
+def _can_edit_scoresheet(user, scoresheet):
+    """Allow only the assigned judge, the contest organizer, or an administrator."""
+    if user.is_superuser:
+        return True
+
+    role_mappings = MapUserToRole.objects.filter(uuid=user.id)
+    if role_mappings.filter(role=MapUserToRole.RoleEnum.ADMIN).exists():
+        return True
+
+    score_mappings = MapScoresheetToTeamJudge.objects.filter(scoresheetid=scoresheet.id)
+    judge_ids = role_mappings.filter(
+        role=MapUserToRole.RoleEnum.JUDGE
+    ).values_list("relatedid", flat=True)
+    if score_mappings.filter(judgeid__in=judge_ids).exists():
+        return True
+
+    organizer_ids = role_mappings.filter(
+        role=MapUserToRole.RoleEnum.ORGANIZER
+    ).values_list("relatedid", flat=True)
+    team_ids = score_mappings.values_list("teamid", flat=True)
+    contest_ids = MapContestToTeam.objects.filter(
+        teamid__in=team_ids
+    ).values_list("contestid", flat=True)
+    return MapContestToOrganizer.objects.filter(
+        contestid__in=contest_ids, organizerid__in=organizer_ids
+    ).exists()
+
 @api_view(["GET"])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
 def scores_by_id(request, scores_id):
     scores = get_object_or_404(Scoresheet, id=scores_id)
+    if not _can_edit_scoresheet(request.user, scores):
+        return Response({"detail": "You cannot view this scoresheet."}, status=status.HTTP_403_FORBIDDEN)
     serializer = ScoresheetSerializer(instance=scores)
     return Response({"ScoreSheet": serializer.data}, status=status.HTTP_200_OK)
 
@@ -35,6 +67,8 @@ def create_score_sheet(request):
 def edit_score_sheet(request):
     try:
         scores = get_object_or_404(Scoresheet, id=request.data["id"])
+        if not _can_edit_scoresheet(request.user, scores):
+            return Response({"detail": "You cannot edit this scoresheet."}, status=status.HTTP_403_FORBIDDEN)
         scores.sheetType = request.data["sheetType"]
         scores.isSubmitted = request.data["isSubmitted"]
         
@@ -127,6 +161,8 @@ def edit_score_sheet(request):
 def update_scores(request):
     try:
         scores = get_object_or_404(Scoresheet, id=request.data["id"])
+        if not _can_edit_scoresheet(request.user, scores):
+            return Response({"detail": "You cannot edit this scoresheet."}, status=status.HTTP_403_FORBIDDEN)
         
         # Update isSubmitted field if provided
         if "isSubmitted" in request.data:
@@ -256,6 +292,8 @@ def update_scores(request):
 @permission_classes([IsAuthenticated])
 def edit_score_sheet_field(request):
     sheet = get_object_or_404(Scoresheet, id=request.data["id"])
+    if not _can_edit_scoresheet(request.user, sheet):
+        return Response({"detail": "You cannot edit this scoresheet."}, status=status.HTTP_403_FORBIDDEN)
 
     field_name = ""
     if isinstance(request.data["field"], int):
@@ -277,6 +315,8 @@ def edit_score_sheet_field(request):
 @permission_classes([IsAuthenticated])
 def delete_score_sheet(request, scores_id):
     scores = get_object_or_404(Scoresheet, id=scores_id)
+    if not _can_edit_scoresheet(request.user, scores):
+        return Response({"detail": "You cannot edit this scoresheet."}, status=status.HTTP_403_FORBIDDEN)
     scores.delete()
     return Response({"detail": "Score Sheet deleted successfully."}, status=status.HTTP_200_OK)
 
@@ -1204,7 +1244,13 @@ def get_scoresheet_details_by_team(request, team_id):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def get_scoresheet_details_for_contest(request):
-    contest = get_object_or_404(Contest, id=request.data["contestid"])
+    try:
+        contestid = int(request.query_params.get("contestid", ""))
+        if contestid <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return Response({"detail": "contestid must be a positive integer"}, status=status.HTTP_400_BAD_REQUEST)
+    contest = get_object_or_404(Contest, id=contestid)
     team_mappings = MapContestToTeam.objects.filter(contestid=contest.id)
     
     # Get all clusters for this contest

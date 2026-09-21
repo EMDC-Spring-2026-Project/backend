@@ -12,11 +12,19 @@ from django.shortcuts import get_object_or_404
 from ...models import MapContestToOrganizer, Organizer, Contest, MapUserToRole
 from ...serializers import MapContestToOrganizerSerializer, ContestSerializer, OrganizerSerializer
 
+
+def _is_admin(user):
+    return user.is_superuser or MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+    ).exists()
+
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def create_contest_organizer_mapping(request):
     try:
+        if not _is_admin(request.user):
+            return Response({"detail": "Administrator access required."}, status=status.HTTP_403_FORBIDDEN)
         map_data = request.data
         result = map_contest_to_organizer(map_data)
         return Response(result, status=status.HTTP_201_CREATED)
@@ -85,6 +93,8 @@ def get_contests_by_organizer_id(request,organizer_id):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def delete_contest_organizer_mapping(request, organizer_id, contest_id):
+    if not _is_admin(request.user):
+        return Response({"detail": "Administrator access required."}, status=status.HTTP_403_FORBIDDEN)
     map_to_delete = get_object_or_404(MapContestToOrganizer, organizerid=organizer_id, contestid=contest_id)
     map_to_delete.delete()
     return Response({"detail": "Contest To Organizer Mapping deleted successfully."}, status=status.HTTP_200_OK)
@@ -166,4 +176,3 @@ def get_organizer_names_by_contests(request):
 
 # endpoint that returns all the contests and their organizers
 # key: contestid, value: list of organizer objects
-

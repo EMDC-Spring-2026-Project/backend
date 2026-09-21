@@ -8,12 +8,12 @@ A comprehensive Django REST Framework backend for the Engineering Machine Design
 - **Contest Management**: Create and manage competitions with teams, judges, and clusters
 - **Scoring System**: Comprehensive scoresheet management for presentations, journals, machine design, and penalties
 - **Tabulation**: Automated score calculation and ranking for preliminary, championship, and redesign rounds
-- **Authentication**: Token-based authentication with password reset/set functionality
+- **Authentication**: Session-cookie authentication with CSRF protection with password reset/set functionality
 - **Shared Passwords**: Support for shared passwords for Organizer and Judge roles
 
 ## Prerequisites
 
-- Python 3.8+
+- Python 3.12+ (matching the Docker image)
 - PostgreSQL 12+
 - pip (Python package manager)
 
@@ -23,7 +23,7 @@ A comprehensive Django REST Framework backend for the Engineering Machine Design
 
 ```bash
 git clone <repository-url>
-cd backend/emdcbackend
+cd backend
 ```
 
 ### 2. Create Virtual Environment
@@ -54,12 +54,8 @@ export POSTGRES_PORT=5432
 ### 5. Run Migrations
 
 ```bash
-python manage.py makemigrations
+cd emdcbackend
 python manage.py migrate
-python manage.py makemigrations auth
-python manage.py migrate auth
-python manage.py makemigrations emdcbackend
-python manage.py migrate emdcbackend
 ```
 
 ### 6. Create Superuser (Optional)
@@ -73,10 +69,10 @@ python manage.py createsuperuser
 ### Development Server
 
 ```bash
-python manage.py runserver
+python manage.py runserver 7004
 ```
 
-The server will be available at `http://127.0.0.1:8000/`
+The server will be available at `http://127.0.0.1:7004/`
 
 ### Production Server
 
@@ -155,7 +151,7 @@ gunicorn emdcbackend.wsgi:application
 
 This project uses **GitHub Actions** for continuous integration and deployment:
 
-- ✅ **Automated Testing**: 288 tests run on every push and PR
+- ✅ **Automated Testing**: 301 tests run on every push and PR
 - ✅ **Code Quality**: Flake8, Black, and isort validation
 - ✅ **Security Scanning**: Safety and Bandit security checks
 - ✅ **Migration Checks**: Ensures no missing migrations
@@ -173,9 +169,9 @@ This project uses **GitHub Actions** for continuous integration and deployment:
 
 ## Testing
 
-The project includes comprehensive test coverage with **288 tests** covering:
+The project includes comprehensive test coverage with **301 tests** covering:
 
-- API endpoints (100% coverage)
+- API endpoints
 - Security (SQL injection, XSS, authentication)
 - Transaction integrity
 - Data validation
@@ -203,10 +199,10 @@ coverage report
 
 ### Test Coverage
 
-- **288 tests total**
-- **274 passing**
-- **4 skipped** (known implementation issues)
-- **Coverage: ~99%+**
+- **301 tests total**
+- **301 passing in the isolated SQLite validation run**
+- **0 skipped in that run**
+- PostgreSQL and browser integration validation remain required.
 
 ## Project Structure
 
@@ -244,7 +240,7 @@ The following environment variables can be configured:
 
 ## Security Features
 
-- Token-based authentication
+- Session-cookie authentication with CSRF protection
 - Role-based access control (Admin, Organizer, Judge, Coach)
 - Input validation and sanitization
 - SQL injection prevention

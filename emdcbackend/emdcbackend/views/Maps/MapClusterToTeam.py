@@ -91,7 +91,13 @@ def delete_cluster_team_mapping_by_id(request, map_id):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def get_teams_by_cluster_rank(request):
-    mappings = MapClusterToTeam.objects.filter(clusterid=request.data["clusterid"])
+    try:
+        clusterid = int(request.query_params.get("clusterid", ""))
+        if clusterid <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return Response({"detail": "clusterid must be a positive integer"}, status=status.HTTP_400_BAD_REQUEST)
+    mappings = MapClusterToTeam.objects.filter(clusterid=clusterid)
     teams = Teams.objects.filter(
         id__in=mappings.values_list('teamid', flat=True),
         cluster_rank__isnull=False

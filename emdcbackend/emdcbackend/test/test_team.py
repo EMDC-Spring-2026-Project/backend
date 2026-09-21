@@ -83,6 +83,20 @@ class TeamAPITests(APITestCase):
         # Note: This might return 201 or 500 depending on implementation
         self.assertIn(response.status_code, [status.HTTP_201_CREATED, status.HTTP_500_INTERNAL_SERVER_ERROR])
 
+    def test_unprivileged_user_cannot_change_team_roster(self):
+        team = Teams.objects.create(team_name="Protected Team")
+        from ..models import MapContestToTeam
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=team.id)
+        unprivileged_user = User.objects.create_user(
+            username="unprivileged@example.com", password="testpassword"
+        )
+        self.client.force_authenticate(user=unprivileged_user)
+
+        response = self.client.delete(reverse('delete_team_by_id', args=[team.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(Teams.objects.filter(id=team.id).exists())
+
     def test_edit_team(self):
         team = Teams.objects.create(
             team_name="Original Team",
@@ -98,6 +112,9 @@ class TeamAPITests(APITestCase):
         coach = Coach.objects.create(first_name="Coach", last_name="Name")
         coach_user = User.objects.create_user(username="coachuser@example.com", password="password")
         MapUserToRole.objects.create(uuid=coach_user.id, role=4, relatedid=coach.id)
+        from ..models import MapCoachToTeam, MapContestToTeam
+        MapCoachToTeam.objects.create(teamid=team.id, coachid=coach.id)
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=team.id)
 
         url = reverse('edit_team')
         data = {
@@ -124,6 +141,8 @@ class TeamAPITests(APITestCase):
             total_score=255.0,
             championship_score=0.0
         )
+        from ..models import MapContestToTeam
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=team.id)
         url = reverse('delete_team_by_id', args=[team.id])
         response = self.client.delete(url)
         # Note: This might return 200 or 500 depending on cleanup logic
@@ -224,4 +243,3 @@ class TeamAPITests(APITestCase):
         except KeyError:
             # Expected due to implementation bug
             self.skipTest("Endpoint has implementation issue: GET request accessing request.data")
-

@@ -69,6 +69,58 @@ class TabulationAPITests(APITestCase):
         # Should return teams with preliminary results
         self.assertIn('data', response.data or {})
 
+    def test_scoring_actions_reject_unassigned_organizer(self):
+        """A signed-in organizer cannot access another organizer's contest."""
+        other_user = User.objects.create_user(
+            username="other-organizer@example.com", password="testpassword"
+        )
+        other_organizer = Organizer.objects.create(
+            first_name="Other", last_name="Organizer"
+        )
+        MapUserToRole.objects.create(
+            uuid=other_user.id,
+            role=MapUserToRole.RoleEnum.ORGANIZER,
+            relatedid=other_organizer.id,
+        )
+        self.client.force_authenticate(user=other_user)
+
+        for endpoint in ('tabulate_scores', 'preliminary_results'):
+            with self.subTest(endpoint=endpoint):
+                response = self.client.put(
+                    reverse(endpoint), {"contestid": self.contest.id}, format='json'
+                )
+                self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        for endpoint in ('championship_results', 'redesign_results'):
+            with self.subTest(endpoint=endpoint):
+                response = self.client.put(
+                    f"{reverse(endpoint)}?contestid={self.contest.id}", {}, format='json'
+                )
+                self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_preliminary_results_excludes_internal_all_teams_cluster(self):
+        """Standings should list a team only in its real scoring cluster."""
+        internal_cluster = JudgeClusters.objects.create(
+            cluster_name="All Teams",
+            cluster_type="preliminary",
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.contest.id, clusterid=internal_cluster.id
+        )
+        MapClusterToTeam.objects.create(
+            clusterid=internal_cluster.id, teamid=self.team.id
+        )
+
+        response = self.client.put(
+            reverse('preliminary_results'),
+            {"contestid": self.contest.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["data"]), 1)
+        self.assertEqual(response.data["data"][0]["cluster_id"], self.cluster.id)
+
     def test_championship_results(self):
         url = reverse('championship_results')
         # Championship results uses PUT but gets contestid from GET params
@@ -282,6 +334,34 @@ class TabulationAPITests(APITestCase):
         response = self.client.put(url_with_params, {}, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn('data', response.data or {})
+
+    def test_redesign_results_excludes_preliminary_only_teams(self):
+        """Redesign standings must not include teams outside the redesign round."""
+        redesign_cluster = JudgeClusters.objects.create(
+            cluster_name="Redesign Cluster", cluster_type="redesign"
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.contest.id, clusterid=redesign_cluster.id
+        )
+        MapClusterToTeam.objects.create(
+            clusterid=redesign_cluster.id, teamid=self.team.id
+        )
+        preliminary_only_team = Teams.objects.create(
+            team_name="Preliminary Only Team", redesign_score=0.0, total_score=250.0
+        )
+        MapContestToTeam.objects.create(
+            contestid=self.contest.id, teamid=preliminary_only_team.id
+        )
+        MapClusterToTeam.objects.create(
+            clusterid=self.cluster.id, teamid=preliminary_only_team.id
+        )
+
+        response = self.client.put(
+            f"{reverse('redesign_results')}?contestid={self.contest.id}", {}, format='json'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual([team["id"] for team in response.data["data"]], [self.team.id])
 
     def test_list_advancers_no_advanced_teams(self):
         """Test list_advancers when no teams are advanced"""
@@ -590,4 +670,3 @@ class AdvanceAPITests(APITestCase):
             self.team.refresh_from_db()
             # Team should no longer be advanced
             self.assertFalse(self.team.advanced_to_championship)
-

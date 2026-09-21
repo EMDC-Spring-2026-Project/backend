@@ -11,10 +11,34 @@ from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from django.shortcuts import get_object_or_404
 
-from ..models import Contest
+from ..models import Contest, MapContestToOrganizer, MapUserToRole
 from ..serializers import ContestSerializer
 from .clusters import make_cluster
 from .Maps.MapClusterToContest import map_cluster_to_contest
+
+
+def _is_admin(user):
+  return user.is_superuser or MapUserToRole.objects.filter(
+      uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+  ).exists()
+
+
+def _is_admin_or_organizer(user):
+  return user.is_superuser or MapUserToRole.objects.filter(
+      uuid=user.id,
+      role__in=[MapUserToRole.RoleEnum.ADMIN, MapUserToRole.RoleEnum.ORGANIZER],
+  ).exists()
+
+
+def _can_edit_contest(user, contest_id):
+  if _is_admin(user):
+    return True
+  organizer_ids = MapUserToRole.objects.filter(
+      uuid=user.id, role=MapUserToRole.RoleEnum.ORGANIZER
+  ).values_list("relatedid", flat=True)
+  return MapContestToOrganizer.objects.filter(
+      contestid=contest_id, organizerid__in=organizer_ids
+  ).exists()
 
 
 @api_view(["GET"])
@@ -60,6 +84,8 @@ def contest_get_all(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def create_contest(request):
+  if not _is_admin_or_organizer(request.user):
+      return Response({"detail": "Administrator or organizer access required."}, status=status.HTTP_403_FORBIDDEN)
   try:
       with transaction.atomic():
         all_teams = make_cluster({"cluster_name": "All Teams"})
@@ -98,6 +124,8 @@ def create_contest_instance(contest_data):
 @permission_classes([IsAuthenticated])
 def edit_contest(request):
   contest = get_object_or_404(Contest, id=request.data["id"])
+  if not _can_edit_contest(request.user, contest.id):
+      return Response({"detail": "You cannot edit this contest."}, status=status.HTTP_403_FORBIDDEN)
   contest.name = request.data["name"]
   contest.date = request.data["date"]
   contest.is_open = request.data["is_open"]
@@ -128,6 +156,8 @@ def delete_contest(request, contest_id):
     8. Teams that ONLY exist in this contest (Teams)
     9. Clusters that ONLY exist in this contest (JudgeClusters)
     """
+    if not _is_admin(request.user):
+        return Response({"detail": "Administrator access required."}, status=status.HTTP_403_FORBIDDEN)
     try:
         with transaction.atomic():
             contest = get_object_or_404(Contest, id=contest_id)
@@ -243,4 +273,3 @@ def delete_contest(request, contest_id):
         return Response({
             "detail": f"Error deleting contest: {str(e)}"
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
