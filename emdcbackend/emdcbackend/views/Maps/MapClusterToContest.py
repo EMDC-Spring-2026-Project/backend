@@ -32,7 +32,7 @@ def contests_by_cluster_id(request, cluster_id):
 @permission_classes([IsAuthenticated])
 def cluster_by_contest_id(request, contest_id):
     try:
-        mapping = MapContestToCluster.objects.get(judgeid=contest_id)
+        mapping = MapContestToCluster.objects.get(contestid=contest_id)
         cluster_id = mapping.clusterid
         cluster = JudgeClusters.objects.get(id=cluster_id)
         serializer = JudgeClustersSerializer(instance=cluster)
@@ -97,4 +97,3 @@ def get_all_teams_cluster(contest_id):
         return {"error": "'All Teams' cluster not found."}, None
     except Exception as e:
         return {"error": str(e)}, None
-

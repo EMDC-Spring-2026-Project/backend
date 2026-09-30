@@ -10,10 +10,35 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import ValidationError
 from django.shortcuts import get_object_or_404
 from django.db import transaction
-from ..models import JudgeClusters
+from ..models import JudgeClusters, MapContestToCluster, MapContestToOrganizer, MapUserToRole
 from ..serializers import JudgeClustersSerializer
 from .Maps.MapClusterToContest import  map_cluster_to_contest
 from ..models import Teams, MapClusterToTeam
+
+
+def _can_manage_contest(user, contest_id):
+  if user.is_superuser or MapUserToRole.objects.filter(
+      uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+  ).exists():
+    return True
+  organizer_ids = MapUserToRole.objects.filter(
+      uuid=user.id, role=MapUserToRole.RoleEnum.ORGANIZER
+  ).values_list("relatedid", flat=True)
+  return MapContestToOrganizer.objects.filter(
+      contestid=contest_id, organizerid__in=organizer_ids
+  ).exists()
+
+
+def _can_manage_cluster(user, cluster_id):
+  if user.is_superuser or MapUserToRole.objects.filter(
+      uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+  ).exists():
+    return True
+  contest_ids = MapContestToCluster.objects.filter(
+      clusterid=cluster_id
+  ).values_list("contestid", flat=True)
+  return any(_can_manage_contest(user, contest_id) for contest_id in contest_ids)
+
 @api_view(["GET"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -35,11 +60,16 @@ def clusters_get_all(request):
 @permission_classes([IsAuthenticated])
 def create_cluster(request):
   try:
+    contest_id = request.data.get("contestid")
+    if not contest_id:
+      return Response({"detail": "contestid is required."}, status=status.HTTP_400_BAD_REQUEST)
+    if not _can_manage_contest(request.user, contest_id):
+      return Response({"detail": "You are not allowed to manage clusters for this contest."}, status=status.HTTP_403_FORBIDDEN)
     with transaction.atomic():
       cluster_response = make_cluster(request.data)
       responses = [
         map_cluster_to_contest({
-          "contestid": request.data["contestid"],
+          "contestid": contest_id,
           "clusterid": cluster_response.get("id")
         })
       ]
@@ -66,6 +96,8 @@ def create_cluster(request):
 @permission_classes([IsAuthenticated])
 def edit_cluster(request):
     cluster = get_object_or_404(JudgeClusters, id=request.data["id"])
+    if not _can_manage_cluster(request.user, cluster.id):
+        return Response({"detail": "You are not allowed to manage this cluster."}, status=status.HTTP_403_FORBIDDEN)
     
     # Cannot change from preliminary to championship/redesign
     original_type = (cluster.cluster_type or "preliminary").lower()
@@ -92,6 +124,8 @@ def delete_cluster(request, cluster_id):
     try:
         with transaction.atomic():
             cluster = get_object_or_404(JudgeClusters, id=cluster_id)
+            if not _can_manage_cluster(request.user, cluster.id):
+                return Response({"detail": "You are not allowed to manage this cluster."}, status=status.HTTP_403_FORBIDDEN)
             
             # Import mapping models
             from ..models import (
@@ -130,4 +164,3 @@ def make_cluster(data):
   if not cluster_response.get('id'):
         raise ValidationError('Cluster creation failed.')
   return cluster_response
-

@@ -10,9 +10,23 @@ from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from django.db import models
 from django.shortcuts import get_object_or_404
-from ...models import JudgeClusters, Judge, MapJudgeToCluster, MapContestToCluster, MapScoresheetToTeamJudge, Scoresheet, MapClusterToTeam
+from ...models import JudgeClusters, Judge, MapJudgeToCluster, MapContestToCluster, MapContestToOrganizer, MapScoresheetToTeamJudge, Scoresheet, MapClusterToTeam, MapUserToRole
 from django.db import transaction
 from ...serializers import JudgeClustersSerializer, JudgeSerializer, ClusterToJudgeSerializer
+
+
+def _can_manage_cluster(user, cluster_id):
+    if user.is_superuser or MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+    ).exists():
+        return True
+    organizer_ids = MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ORGANIZER
+    ).values_list("relatedid", flat=True)
+    contest_ids = MapContestToCluster.objects.filter(clusterid=cluster_id).values_list("contestid", flat=True)
+    return MapContestToOrganizer.objects.filter(
+        contestid__in=contest_ids, organizerid__in=organizer_ids
+    ).exists()
 
 
 @api_view(["POST"])
@@ -21,6 +35,11 @@ from ...serializers import JudgeClustersSerializer, JudgeSerializer, ClusterToJu
 def create_cluster_judge_mapping(request):
     try:
         map_data = request.data
+        cluster_id = map_data.get("clusterid")
+        if not cluster_id:
+            return Response({"detail": "clusterid is required."}, status=status.HTTP_400_BAD_REQUEST)
+        if not _can_manage_cluster(request.user, cluster_id):
+            return Response({"detail": "You are not allowed to change this cluster."}, status=status.HTTP_403_FORBIDDEN)
         result = map_cluster_to_judge(map_data)
         return Response(result, status=status.HTTP_201_CREATED)
 
@@ -255,6 +274,9 @@ def _delete_cluster_judge_mapping_and_scores(map_id: int):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def delete_cluster_judge_mapping_by_id(request, map_id):
+    mapping = get_object_or_404(MapJudgeToCluster, id=map_id)
+    if not _can_manage_cluster(request.user, mapping.clusterid):
+        return Response({"detail": "You are not allowed to change this cluster."}, status=status.HTTP_403_FORBIDDEN)
     _delete_cluster_judge_mapping_and_scores(map_id)
     return Response({"detail": "Cluster To Judge Mapping deleted successfully."}, status=status.HTTP_200_OK)
 

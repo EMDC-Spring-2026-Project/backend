@@ -1,7 +1,7 @@
 from rest_framework import status
 from rest_framework.test import APITestCase
 from django.urls import reverse
-from ..models import Organizer, MapUserToRole  # Adjust the import path according to your project structure
+from ..models import Organizer, MapUserToRole, Contest, Teams, MapContestToOrganizer, MapContestToTeam
 from django.contrib.auth import get_user_model
 from ..serializers import OrganizerSerializer  # Assuming you have a serializer for Organizer
 
@@ -66,7 +66,6 @@ class OrganizerAPITests(APITestCase):
 
     def test_organizer_disqualify_team(self):
         """Test organizer disqualifying a team"""
-        from ..models import Teams
         team = Teams.objects.create(
             team_name="Test Team",
             journal_score=90.0,
@@ -77,12 +76,24 @@ class OrganizerAPITests(APITestCase):
             total_score=255.0,
             championship_score=0.0
         )
+        contest = Contest.objects.create(
+            name="Test Contest", date="2026-01-01", is_open=True, is_tabulated=False
+        )
+        MapContestToOrganizer.objects.create(contestid=contest.id, organizerid=self.organizer.id)
+        MapContestToTeam.objects.create(contestid=contest.id, teamid=team.id)
         url = reverse('organizer_disqualify_team')
         data = {"teamid": team.id, "organizer_disqualified": True}
         response = self.client.post(url, data, format='json', **self.get_auth_headers())
-        # Should return 200 or error depending on implementation
-        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR])
-        if response.status_code == status.HTTP_200_OK:
-            team.refresh_from_db()
-            # Team should be disqualified
-            self.assertTrue(team.organizer_disqualified)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        team.refresh_from_db()
+        self.assertTrue(team.organizer_disqualified)
+
+    def test_unassigned_organizer_cannot_disqualify_team(self):
+        team = Teams.objects.create(team_name="Protected Team")
+        response = self.client.post(
+            reverse('organizer_disqualify_team'),
+            {"teamid": team.id, "organizer_disqualified": True}, format='json'
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        team.refresh_from_db()
+        self.assertFalse(team.organizer_disqualified)

@@ -11,7 +11,7 @@ from rest_framework.exceptions import ValidationError
 from django.shortcuts import get_object_or_404
 from django.db import transaction
 from django.contrib.auth.models import User
-from ..models import Organizer, Teams, Scoresheet, MapScoresheetToTeamJudge, MapContestToOrganizer
+from ..models import Organizer, Teams, Scoresheet, MapScoresheetToTeamJudge, MapContestToOrganizer, MapContestToTeam
 from ..serializers import OrganizerSerializer, TeamSerializer
 from ..auth.views import create_user, delete_user
 from .Maps.MapUserToRole import create_user_role_map
@@ -23,6 +23,20 @@ from ..auth.views import delete_user_by_id
 from django.contrib.auth import get_user_model
 from ..auth.password_utils import send_set_password_email
 from django.contrib.sessions.models import Session
+
+
+def _can_manage_team(user, team_id):
+    if user.is_superuser or MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+    ).exists():
+        return True
+    organizer_ids = MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ORGANIZER
+    ).values_list("relatedid", flat=True)
+    contest_ids = MapContestToTeam.objects.filter(teamid=team_id).values_list("contestid", flat=True)
+    return MapContestToOrganizer.objects.filter(
+        contestid__in=contest_ids, organizerid__in=organizer_ids
+    ).exists()
 
 # get organizer by id
 @api_view(["GET"])
@@ -212,7 +226,12 @@ def get_all_organizers(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def organizer_disqualify_team(request):
-    team = get_object_or_404(Teams, id=request.data["teamid"])
+    team_id = request.data.get("teamid")
+    if team_id is None or "organizer_disqualified" not in request.data:
+        return Response({"detail": "teamid and organizer_disqualified are required."}, status=status.HTTP_400_BAD_REQUEST)
+    team = get_object_or_404(Teams, id=team_id)
+    if not _can_manage_team(request.user, team.id):
+        return Response({"detail": "You are not allowed to disqualify this team."}, status=status.HTTP_403_FORBIDDEN)
     team.organizer_disqualified = request.data["organizer_disqualified"]
     if team.judge_disqualified == True and team.organizer_disqualified == True:
         team.cluster_rank = None

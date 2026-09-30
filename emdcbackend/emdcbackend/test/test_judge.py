@@ -2,7 +2,7 @@ from django.urls import reverse
 from rest_framework.test import APITestCase
 from rest_framework import status
 from django.contrib.auth.models import User
-from ..models import Judge, Contest, JudgeClusters, MapUserToRole, MapContestToJudge, MapJudgeToCluster
+from ..models import Judge, Contest, JudgeClusters, MapUserToRole, MapContestToJudge, MapJudgeToCluster, Teams
 from ..serializers import JudgeSerializer
 
 
@@ -134,6 +134,8 @@ class JudgeAPITests(APITestCase):
         self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR])
 
     def test_delete_judge(self):
+        self.client.force_authenticate(user=self.user)
+        self.assertTrue(MapUserToRole.objects.filter(uuid=self.user.id, role=1).exists())
         judge = Judge.objects.create(
             first_name="To Delete",
             last_name="Judge",
@@ -146,7 +148,25 @@ class JudgeAPITests(APITestCase):
         url = reverse('delete_judge', args=[judge.id])
         response = self.client.delete(url)
         # Note: This might return 200 or 500 depending on cleanup logic
-        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_500_INTERNAL_SERVER_ERROR])
+        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_500_INTERNAL_SERVER_ERROR], response.data)
+
+    def test_unassigned_user_cannot_delete_judge(self):
+        judge = Judge.objects.create(
+            first_name="Protected",
+            last_name="Judge",
+            phone_number="1234567890",
+            contestid=self.contest.id,
+        )
+        MapContestToJudge.objects.create(contestid=self.contest.id, judgeid=judge.id)
+        unassigned_user = User.objects.create_user(
+            username="unassigned@example.com", password="testpassword"
+        )
+        self.client.force_authenticate(user=unassigned_user)
+
+        response = self.client.delete(reverse('delete_judge', args=[judge.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(Judge.objects.filter(id=judge.id).exists())
 
     def test_are_all_score_sheets_submitted(self):
         """Test checking if all score sheets are submitted for judges"""
@@ -201,3 +221,18 @@ class JudgeAPITests(APITestCase):
             # Team should be disqualified
             self.assertTrue(team.judge_disqualified)
 
+    def test_unassigned_user_cannot_disqualify_team(self):
+        team = Teams.objects.create(team_name="Protected Team")
+        unassigned_user = User.objects.create_user(
+            username="unassigned-disqualify@example.com", password="testpassword"
+        )
+        self.client.force_authenticate(user=unassigned_user)
+
+        response = self.client.post(
+            reverse('judge_disqualify_team'),
+            {"teamid": team.id, "judge_disqualified": True}, format='json'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        team.refresh_from_db()
+        self.assertFalse(team.judge_disqualified)

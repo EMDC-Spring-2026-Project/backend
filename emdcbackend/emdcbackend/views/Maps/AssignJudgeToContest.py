@@ -15,11 +15,24 @@ from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from django.shortcuts import get_object_or_404
 
-from ...models import MapContestToJudge, Judge, Contest, MapJudgeToCluster, MapContestToTeam, MapScoresheetToTeamJudge, Scoresheet, MapClusterToTeam
+from ...models import MapContestToJudge, Judge, Contest, MapJudgeToCluster, MapContestToTeam, MapContestToCluster, MapContestToOrganizer, MapScoresheetToTeamJudge, Scoresheet, MapClusterToTeam, MapUserToRole
 from ...serializers import JudgeSerializer
 from .MapContestToJudge import create_contest_to_judge_map
 from ...views.Maps.MapClusterToJudge import map_cluster_to_judge
 from ..judge import sync_judge_sheet_flags
+
+
+def _can_manage_contest(user, contest_id):
+    if user.is_superuser or MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+    ).exists():
+        return True
+    organizer_ids = MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ORGANIZER
+    ).values_list("relatedid", flat=True)
+    return MapContestToOrganizer.objects.filter(
+        contestid=contest_id, organizerid__in=organizer_ids
+    ).exists()
 
 
 @api_view(["POST"])
@@ -53,6 +66,10 @@ def assign_judge_to_contest(request):
                 {"error": "judge_id, contest_id, and cluster_id are required"}, 
                 status=status.HTTP_400_BAD_REQUEST
             )
+        if not _can_manage_contest(request.user, contest_id):
+            return Response({"error": "You are not allowed to manage this contest."}, status=status.HTTP_403_FORBIDDEN)
+        if not MapContestToCluster.objects.filter(contestid=contest_id, clusterid=cluster_id).exists():
+            return Response({"error": "The selected cluster does not belong to this contest."}, status=status.HTTP_400_BAD_REQUEST)
         
         # Verify judge exists
         judge = get_object_or_404(Judge, id=judge_id)
@@ -249,6 +266,8 @@ def remove_judge_from_contest(request, judge_id, contest_id):
     This will also clean up their score sheets for that contest.
     """
     try:
+        if not _can_manage_contest(request.user, contest_id):
+            return Response({"error": "You are not allowed to manage this contest."}, status=status.HTTP_403_FORBIDDEN)
         
         # Find the mapping
         mapping = get_object_or_404(
@@ -257,11 +276,18 @@ def remove_judge_from_contest(request, judge_id, contest_id):
             contestid=contest_id
         )
         
-        # Get the judge's cluster to clean up scoresheets
-        cluster_mapping = MapJudgeToCluster.objects.filter(judgeid=judge_id).first()
+        # Limit cleanup to clusters belonging to the contest being removed.
+        # A judge can work in multiple contests, so selecting their first
+        # cluster assignment could otherwise remove work from another contest.
+        contest_cluster_ids = MapContestToCluster.objects.filter(
+            contestid=contest_id
+        ).values_list("clusterid", flat=True)
+        cluster_mappings = MapJudgeToCluster.objects.filter(
+            judgeid=judge_id, clusterid__in=contest_cluster_ids
+        )
         
         # Clean up scoresheets for this judge-contest combination
-        if cluster_mapping:
+        if cluster_mappings.exists():
             # Get all teams in the contest
             contest_teams = MapContestToTeam.objects.filter(contestid=contest_id)
             team_ids = contest_teams.values_list('teamid', flat=True)
@@ -280,8 +306,8 @@ def remove_judge_from_contest(request, judge_id, contest_id):
             # Delete the scoresheet mappings
             deleted_mappings = scoresheet_mappings.delete()
             
-            # Delete the cluster-judge mapping
-            cluster_mapping.delete()
+            # Delete only the judge's assignments for this contest.
+            cluster_mappings.delete()
         else:
             deleted_scoresheets = (0, {})
             deleted_mappings = (0, {})
@@ -315,6 +341,10 @@ def remove_judge_from_cluster(request, judge_id, cluster_id):
         
     try:
         with transaction.atomic():
+            contest_cluster_mapping = MapContestToCluster.objects.filter(clusterid=cluster_id).first()
+            contest_id = contest_cluster_mapping.contestid if contest_cluster_mapping else None
+            if not contest_id or not _can_manage_contest(request.user, contest_id):
+                return Response({"error": "You are not allowed to manage this contest."}, status=status.HTTP_403_FORBIDDEN)
         # Find the cluster-judge mapping
             cluster_mapping = get_object_or_404(
             MapJudgeToCluster, 
