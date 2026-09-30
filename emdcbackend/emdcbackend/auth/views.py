@@ -129,8 +129,24 @@ def csrf_view(request):
 # User queries / auth
 # -----------------------
 
+def _can_manage_user(request_user, target_user_id):
+    """Return whether a user may view or change the requested account."""
+    return (
+        request_user.is_superuser
+        or request_user.id == target_user_id
+        or MapUserToRole.objects.filter(uuid=request_user.id, role=1).exists()
+    )
+
+
 @api_view(["GET"])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
 def user_by_id(request, user_id):
+    if not _can_manage_user(request.user, user_id):
+        return Response(
+            {"detail": "You do not have permission to view this user."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     user = get_object_or_404(User, id=user_id)
     serializer = UserSerializer(instance=user)
     return Response({"user": serializer.data}, status=status.HTTP_200_OK)
@@ -174,6 +190,11 @@ def signup(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def delete_user_by_id(request, user_id):
+    if not _can_manage_user(request.user, user_id):
+        return Response(
+            {"detail": "You do not have permission to delete this user."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     delete_user(user_id)
     return Response({"detail": "User deleted successfully."}, status=status.HTTP_200_OK)
 
@@ -186,7 +207,16 @@ def edit_user(request):
     Allows changing username (email) and/or password for the current user.
     Adds STRICT email validation on username change.
     """
-    user = get_object_or_404(User, id=request.data["id"])
+    user_id = request.data.get("id")
+    if user_id is None:
+        return Response({"detail": "id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    user = get_object_or_404(User, id=user_id)
+    if not _can_manage_user(request.user, user.id):
+        return Response(
+            {"detail": "You do not have permission to edit this user."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     # Update username (email) with strict validation
     new_username = request.data.get("username")
