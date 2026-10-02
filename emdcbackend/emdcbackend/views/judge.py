@@ -66,10 +66,13 @@ def _can_manage_judge(user, judge_id):
         uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
     ).exists():
         return True
-    contest_ids = MapContestToJudge.objects.filter(
+    contest_ids = list(MapContestToJudge.objects.filter(
         judgeid=judge_id
-    ).values_list("contestid", flat=True)
-    return any(_can_manage_contest(user, contest_id) for contest_id in contest_ids)
+    ).values_list("contestid", flat=True))
+    # Judge profile changes and deletion affect all contest assignments.
+    return bool(contest_ids) and all(
+        _can_manage_contest(user, contest_id) for contest_id in contest_ids
+    )
 
 
 @api_view(["GET"])

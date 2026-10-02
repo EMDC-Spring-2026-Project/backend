@@ -23,10 +23,22 @@ from rest_framework.decorators import api_view, authentication_classes, permissi
 from rest_framework.authentication import SessionAuthentication
 from django.shortcuts import get_object_or_404
 
+
+def _is_admin(user):
+    return user.is_superuser or MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+    ).exists()
+
+
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def create_user_role_mapping(request):
+    if not _is_admin(request.user):
+        return Response(
+            {"detail": "Administrator access required."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     try:
         # Call the function that creates the user-role mapping
         mapping = create_user_role_map(request.data)  # This function can raise ValidationError
@@ -78,6 +90,11 @@ def get_admin_by_user(request, userid):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def delete_user_role_mapping(request, mapping_id):
+    if not _is_admin(request.user):
+        return Response(
+            {"detail": "Administrator access required."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     mapping = get_object_or_404(MapUserToRole, id=mapping_id)
     mapping.delete()
     return Response({"detail": "Mapping deleted successfully."}, status=status.HTTP_200_OK)

@@ -11,6 +11,8 @@ from rest_framework.exceptions import ValidationError
 from django.shortcuts import get_object_or_404
 from django.db import transaction
 from django.contrib.auth.models import User
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.validators import validate_email
 from ..models import Organizer, Teams, Scoresheet, MapScoresheetToTeamJudge, MapContestToOrganizer, MapContestToTeam
 from ..serializers import OrganizerSerializer, TeamSerializer
 from ..auth.views import create_user, delete_user
@@ -30,16 +32,37 @@ def _can_manage_team(user, team_id):
         uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
     ).exists():
         return True
-    organizer_ids = MapUserToRole.objects.filter(
+    organizer_ids = list(MapUserToRole.objects.filter(
         uuid=user.id, role=MapUserToRole.RoleEnum.ORGANIZER
-    ).values_list("relatedid", flat=True)
-    contest_ids = MapContestToTeam.objects.filter(teamid=team_id).values_list("contestid", flat=True)
-    return MapContestToOrganizer.objects.filter(
+    ).values_list("relatedid", flat=True))
+    contest_ids = list(MapContestToTeam.objects.filter(
+        teamid=team_id
+    ).values_list("contestid", flat=True))
+    if not organizer_ids or not contest_ids:
+        return False
+    managed_contest_ids = set(MapContestToOrganizer.objects.filter(
         contestid__in=contest_ids, organizerid__in=organizer_ids
+    ).values_list("contestid", flat=True))
+    return set(contest_ids).issubset(managed_contest_ids)
+
+
+def _is_admin(user):
+    return user.is_superuser or MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+    ).exists()
+
+
+def _can_edit_organizer(user, organizer_id):
+    return _is_admin(user) or MapUserToRole.objects.filter(
+        uuid=user.id,
+        role=MapUserToRole.RoleEnum.ORGANIZER,
+        relatedid=organizer_id,
     ).exists()
 
 # get organizer by id
 @api_view(["GET"])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
 def organizer_by_id(request, organizer_id):
     organizer = get_object_or_404(Organizer, id=organizer_id)
     serializer = OrganizerSerializer(instance=organizer)
@@ -50,6 +73,11 @@ def organizer_by_id(request, organizer_id):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def create_organizer(request):
+    if not _is_admin(request.user):
+        return Response(
+            {"detail": "Administrator access required."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     try:
         with transaction.atomic():
             user_response, organizer_response = create_user_and_organizer(request.data)  # creates user and organizer
@@ -124,6 +152,11 @@ def make_organizer(organizer_data):
 def edit_organizer(request):
     try:
         organizer = get_object_or_404(Organizer, id=request.data["id"])
+        if not _can_edit_organizer(request.user, organizer.id):
+            return Response(
+                {"detail": "You cannot edit this organizer profile."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         
         # Use filter().first() instead of get() to handle missing mappings gracefully
         organizer_mapping = MapUserToRole.objects.filter(
@@ -136,8 +169,24 @@ def edit_organizer(request):
             user_id = organizer_mapping.uuid
             try:
                 user = User.objects.get(id=user_id)
-                user.username = request.data["username"]
-                user.save()
+                new_username = request.data.get("username")
+                if new_username and new_username != user.username:
+                    try:
+                        validate_email(new_username)
+                    except DjangoValidationError:
+                        return Response(
+                            {"detail": "Enter a valid email address."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    if User.objects.filter(
+                        username__iexact=new_username
+                    ).exclude(id=user.id).exists():
+                        return Response(
+                            {"detail": "Email already taken."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    user.username = new_username
+                    user.save()
             except User.DoesNotExist:
                 # User doesn't exist, skip username update
                 pass
@@ -175,6 +224,11 @@ def _delete_user_sessions(user_id: int) -> None:
 @permission_classes([IsAuthenticated])
 def delete_organizer(request, organizer_id):
     try:
+        if not _is_admin(request.user):
+            return Response(
+                {"detail": "Administrator access required."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         with transaction.atomic():
             # Fetch the organizer
             organizer = get_object_or_404(Organizer, id=organizer_id)

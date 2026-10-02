@@ -25,10 +25,14 @@ from django.db import transaction
 
 
 def _can_manage_team(user, team_id):
-    contest_ids = MapContestToTeam.objects.filter(
+    contest_ids = list(MapContestToTeam.objects.filter(
         teamid=team_id
-    ).values_list("contestid", flat=True)
-    return any(_can_manage_contest(user, contest_id) for contest_id in contest_ids)
+    ).values_list("contestid", flat=True))
+    # Editing or deleting a team changes the shared team record and related data
+    # for every contest. An organizer must therefore manage every linked contest.
+    return bool(contest_ids) and all(
+        _can_manage_contest(user, contest_id) for contest_id in contest_ids
+    )
 
 
 def _can_manage_contest(user, contest_id):

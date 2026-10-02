@@ -7,7 +7,7 @@ from django.utils.http import urlsafe_base64_encode
 from django.utils.encoding import force_bytes
 from django.core.exceptions import ValidationError
 from django.contrib.auth.password_validation import validate_password
-from ..models import RoleSharedPassword, Admin, MapUserToRole
+from ..models import RoleSharedPassword, Admin, Organizer, MapUserToRole
 from ..auth.password_validators import (
     UppercasePasswordValidator,
     LowercasePasswordValidator,
@@ -56,6 +56,23 @@ class PasswordAPITests(APITestCase):
         self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_500_INTERNAL_SERVER_ERROR])
         if response.status_code == status.HTTP_200_OK:
             self.assertIn('detail', response.data)
+
+    def test_password_reset_does_not_reveal_ineligible_accounts(self):
+        organizer_user = User.objects.create_user(
+            username="organizer-reset@example.com", password="OrganizerPass123!"
+        )
+        organizer = Organizer.objects.create(first_name="Test", last_name="Organizer")
+        MapUserToRole.objects.create(
+            uuid=organizer_user.id, role=2, relatedid=organizer.id
+        )
+        url = reverse('request_password_reset')
+
+        existing_response = self.client.post(url, {"username": organizer_user.username})
+        missing_response = self.client.post(url, {"username": "missing@example.com"})
+
+        self.assertEqual(existing_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(missing_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(existing_response.data, missing_response.data)
 
     def test_validate_password_token(self):
         """Test validating password reset token"""
@@ -380,4 +397,3 @@ class PasswordValidationTests(APITestCase):
                 validate_password(strong_password)
             except ValidationError as e:
                 self.fail(f"Password '{strong_password}' should have passed but failed: {e}")
-

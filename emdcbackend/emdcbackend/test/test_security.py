@@ -164,6 +164,12 @@ class SecurityTests(APITestCase):
     
     def test_email_validation_in_signup(self):
         """Test that signup requires valid email format"""
+        admin_user = User.objects.create_user(
+            username='validation-admin@example.com', password='AdminPassword123!'
+        )
+        admin = Admin.objects.create(first_name='Validation', last_name='Admin')
+        MapUserToRole.objects.create(uuid=admin_user.id, role=1, relatedid=admin.id)
+        self.client.force_authenticate(user=admin_user)
         url = reverse('signup')
         invalid_emails = [
             'notanemail',
@@ -184,6 +190,12 @@ class SecurityTests(APITestCase):
     
     def test_password_strength_validation(self):
         """Test password validation (if implemented)"""
+        admin_user = User.objects.create_user(
+            username='password-admin@example.com', password='AdminPassword123!'
+        )
+        admin = Admin.objects.create(first_name='Password', last_name='Admin')
+        MapUserToRole.objects.create(uuid=admin_user.id, role=1, relatedid=admin.id)
+        self.client.force_authenticate(user=admin_user)
         url = reverse('signup')
         # Django's default validators should catch weak passwords
         weak_passwords = [
@@ -376,4 +388,3 @@ class SecurityTests(APITestCase):
             status.HTTP_403_FORBIDDEN,  # If admin only
             status.HTTP_401_UNAUTHORIZED
         ])
-

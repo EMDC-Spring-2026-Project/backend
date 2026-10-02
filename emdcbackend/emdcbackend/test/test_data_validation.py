@@ -8,7 +8,7 @@ from rest_framework import status
 from django.contrib.auth.models import User
 from datetime import date, datetime
 from ..models import (
-    Contest, Teams, Judge, Organizer, MapContestToOrganizer,
+    Contest, Teams, Judge, Organizer, Admin, MapContestToOrganizer,
     MapUserToRole, MapContestToTeam, Scoresheet, ScoresheetEnum
 )
 
@@ -174,6 +174,12 @@ class DataValidationTests(APITestCase):
     
     def test_email_format_edge_cases(self):
         """Test email format edge cases"""
+        admin_user = User.objects.create_user(
+            username='email-admin@example.com', password='AdminPassword123!'
+        )
+        admin = Admin.objects.create(first_name='Email', last_name='Admin')
+        MapUserToRole.objects.create(uuid=admin_user.id, role=1, relatedid=admin.id)
+        self.client.force_authenticate(user=admin_user)
         url = reverse('signup')
         
         edge_case_emails = [
@@ -385,4 +391,3 @@ class DataValidationTests(APITestCase):
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             status.HTTP_200_OK  # If it handles gracefully
         ])
-

@@ -34,10 +34,13 @@ def _can_manage_cluster(user, cluster_id):
       uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
   ).exists():
     return True
-  contest_ids = MapContestToCluster.objects.filter(
+  contest_ids = list(MapContestToCluster.objects.filter(
       clusterid=cluster_id
-  ).values_list("contestid", flat=True)
-  return any(_can_manage_contest(user, contest_id) for contest_id in contest_ids)
+  ).values_list("contestid", flat=True))
+  # Cluster edits and deletion affect every contest using the shared cluster.
+  return bool(contest_ids) and all(
+      _can_manage_contest(user, contest_id) for contest_id in contest_ids
+  )
 
 @api_view(["GET"])
 @authentication_classes([SessionAuthentication])

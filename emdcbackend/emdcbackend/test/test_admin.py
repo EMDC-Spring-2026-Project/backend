@@ -71,3 +71,47 @@ class AdminTests(APITestCase):
             # If it fails, it's likely due to mapping issues in the view
             # We'll just check that it doesn't crash
             self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_500_INTERNAL_SERVER_ERROR])
+
+    def test_non_admin_cannot_access_admin_management(self):
+        ordinary_user = User.objects.create_user(
+            username="ordinary@example.com", password="testpassword"
+        )
+        self.client.force_authenticate(user=ordinary_user)
+
+        detail_response = self.client.get(
+            reverse("admin_by_id", args=[self.admin.id])
+        )
+        list_response = self.client.get(reverse("admins_get_all"))
+        create_response = self.client.post(
+            reverse("create_admin"),
+            {
+                "username": "unauthorized-admin@example.com",
+                "password": "Password123!",
+                "first_name": "Unauthorized",
+                "last_name": "Admin",
+            },
+        )
+        edit_response = self.client.post(
+            reverse("edit_admin"),
+            {
+                "id": self.admin.id,
+                "first_name": "Changed",
+                "last_name": "Name",
+            },
+        )
+        delete_response = self.client.delete(
+            reverse("delete_admin", args=[self.admin.id])
+        )
+
+        for response in (
+            detail_response,
+            list_response,
+            create_response,
+            edit_response,
+            delete_response,
+        ):
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.admin.refresh_from_db()
+        self.assertEqual(self.admin.first_name, "Test")
+        self.assertFalse(User.objects.filter(username="unauthorized-admin@example.com").exists())

@@ -30,16 +30,19 @@ def _can_edit_scoresheet(user, scoresheet):
     if score_mappings.filter(judgeid__in=judge_ids).exists():
         return True
 
-    organizer_ids = role_mappings.filter(
+    organizer_ids = list(role_mappings.filter(
         role=MapUserToRole.RoleEnum.ORGANIZER
-    ).values_list("relatedid", flat=True)
+    ).values_list("relatedid", flat=True))
     team_ids = score_mappings.values_list("teamid", flat=True)
-    contest_ids = MapContestToTeam.objects.filter(
+    contest_ids = set(MapContestToTeam.objects.filter(
         teamid__in=team_ids
-    ).values_list("contestid", flat=True)
-    return MapContestToOrganizer.objects.filter(
+    ).values_list("contestid", flat=True))
+    if not organizer_ids or not contest_ids:
+        return False
+    managed_contest_ids = set(MapContestToOrganizer.objects.filter(
         contestid__in=contest_ids, organizerid__in=organizer_ids
-    ).exists()
+    ).values_list("contestid", flat=True))
+    return contest_ids.issubset(managed_contest_ids)
 
 @api_view(["GET"])
 @authentication_classes([SessionAuthentication])

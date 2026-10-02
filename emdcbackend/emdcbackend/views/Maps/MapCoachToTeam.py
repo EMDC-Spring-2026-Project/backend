@@ -10,13 +10,45 @@ from rest_framework.response import Response
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from django.shortcuts import get_object_or_404
-from ...models import MapCoachToTeam, Coach, Teams, MapUserToRole, Contest, MapContestToTeam
+from ...models import (
+    MapCoachToTeam, Coach, Teams, MapUserToRole, Contest, MapContestToTeam,
+    MapContestToOrganizer,
+)
 from ...serializers import CoachToTeamSerializer, CoachSerializer, TeamSerializer
+
+
+def _can_manage_team(user, team_id):
+    if user.is_superuser or MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+    ).exists():
+        return True
+    organizer_ids = list(MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ORGANIZER
+    ).values_list("relatedid", flat=True))
+    contest_ids = list(MapContestToTeam.objects.filter(
+        teamid=team_id
+    ).values_list("contestid", flat=True))
+    if not organizer_ids or not contest_ids:
+        return False
+    managed_contest_ids = set(MapContestToOrganizer.objects.filter(
+        contestid__in=contest_ids, organizerid__in=organizer_ids
+    ).values_list("contestid", flat=True))
+    return set(contest_ids).issubset(managed_contest_ids)
 
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def create_coach_team_mapping(request):
+    team_id = request.data.get("teamid")
+    if team_id is None:
+        return Response(
+            {"detail": "teamid is required."}, status=status.HTTP_400_BAD_REQUEST
+        )
+    if not _can_manage_team(request.user, team_id):
+        return Response(
+            {"detail": "You are not allowed to change this team's coach."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     serializer = CoachToTeamSerializer(data=request.data)
     if serializer.is_valid():
         serializer.save()
@@ -116,6 +148,11 @@ def coaches_by_teams(request):
 @permission_classes([IsAuthenticated])
 def delete_coach_team_mapping_by_id(request, map_id):
     map_to_delete = get_object_or_404(MapCoachToTeam, id=map_id)
+    if not _can_manage_team(request.user, map_to_delete.teamid):
+        return Response(
+            {"detail": "You are not allowed to change this team's coach."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     map_to_delete.delete()
     return Response({"detail": "Coach To Team Mapping deleted successfully."}, status=status.HTTP_200_OK)
 

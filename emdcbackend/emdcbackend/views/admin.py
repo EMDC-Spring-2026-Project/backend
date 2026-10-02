@@ -18,11 +18,20 @@ from .Maps.MapUserToRole import create_user_role_map
 from ..models import MapUserToRole
 from ..auth.views import User, delete_user_by_id
 
+
+def _is_admin(user):
+    return user.is_superuser or MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+    ).exists()
+
+
 # get an admin by a certain id
 @api_view(["GET"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def admin_by_id(request, admin_id):
+  if not _is_admin(request.user):
+    return Response({"detail": "Administrator access required."}, status=status.HTTP_403_FORBIDDEN)
   admin = get_object_or_404(Admin, id = admin_id)
   serializer = AdminSerializer(instance=admin)
   return Response({"Admin": serializer.data}, status=status.HTTP_200_OK)
@@ -32,6 +41,8 @@ def admin_by_id(request, admin_id):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def admins_get_all(request):
+  if not _is_admin(request.user):
+    return Response({"detail": "Administrator access required."}, status=status.HTTP_403_FORBIDDEN)
   admins = Admin.objects.all()
   serializer = AdminSerializer(admins, many=True)
   return Response({"Admins":serializer.data}, status=status.HTTP_200_OK)
@@ -41,6 +52,8 @@ def admins_get_all(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def create_admin(request):
+    if not _is_admin(request.user):
+        return Response({"detail": "Administrator access required."}, status=status.HTTP_403_FORBIDDEN)
     username = request.data.get("username")
     if not username:
         return Response({"detail": "username is required"}, status=status.HTTP_400_BAD_REQUEST)
@@ -94,7 +107,7 @@ def create_user_and_admin(data):
     user_response = create_user(user_data)
     if not user_response.get('user'):
         raise ValidationError('User creation failed.')
-    
+
     admin_data = {"first_name": data["first_name"], "last_name": data["last_name"]}
     admin_response = make_admin(admin_data)
     if not admin_response.get('id'):
@@ -114,6 +127,8 @@ def make_admin(data):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def edit_admin(request):
+    if not _is_admin(request.user):
+        return Response({"detail": "Administrator access required."}, status=status.HTTP_403_FORBIDDEN)
     admin = get_object_or_404(Admin, id=request.data["id"])
     admin.first_name = request.data["first_name"]
     admin.last_name = request.data["last_name"]
@@ -129,6 +144,8 @@ def edit_admin(request):
 @permission_classes([IsAuthenticated])
 def delete_admin(request, admin_id):
     try:
+        if not _is_admin(request.user):
+            return Response({"detail": "Administrator access required."}, status=status.HTTP_403_FORBIDDEN)
         admin = get_object_or_404(Admin, id=admin_id)
         admin_mapping = MapUserToRole.objects.get(role=MapUserToRole.RoleEnum.ADMIN, relatedid=admin_id)
         user_id = admin_mapping.uuid
@@ -142,5 +159,3 @@ def delete_admin(request, admin_id):
         return Response({"error": "Admin mapping not found."}, status=status.HTTP_404_NOT_FOUND)
     except Exception as e:
         return Response({"error": f"An error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    
