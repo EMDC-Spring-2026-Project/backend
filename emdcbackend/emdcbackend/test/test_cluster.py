@@ -2,7 +2,7 @@ from django.urls import reverse
 from rest_framework.test import APITestCase
 from rest_framework import status
 from django.contrib.auth.models import User
-from ..models import JudgeClusters, Admin, MapUserToRole
+from ..models import JudgeClusters, Admin, Contest, MapContestToCluster, MapUserToRole
 from ..serializers import JudgeClustersSerializer
 
 
@@ -74,3 +74,18 @@ class ClusterAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertFalse(JudgeClusters.objects.filter(id=cluster.id).exists())
 
+    def test_unassigned_user_cannot_delete_cluster(self):
+        contest = Contest.objects.create(
+            name="Test Contest", date="2026-01-01", is_open=True, is_tabulated=False
+        )
+        cluster = JudgeClusters.objects.create(cluster_name="Protected Cluster")
+        MapContestToCluster.objects.create(contestid=contest.id, clusterid=cluster.id)
+        unassigned_user = User.objects.create_user(
+            username="unassigned-cluster@example.com", password="testpassword"
+        )
+        self.client.force_authenticate(user=unassigned_user)
+
+        response = self.client.delete(reverse('delete_cluster', args=[cluster.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(JudgeClusters.objects.filter(id=cluster.id).exists())

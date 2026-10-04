@@ -6,7 +6,7 @@ from datetime import date
 from ..models import (
     Contest, Judge, Teams, Coach, Organizer, JudgeClusters,
     MapCoachToTeam, MapContestToJudge, MapContestToTeam, MapContestToOrganizer,
-    MapClusterToTeam, MapJudgeToCluster, MapScoresheetToTeamJudge,
+    MapClusterToTeam, MapJudgeToCluster, MapContestToCluster, MapScoresheetToTeamJudge,
     MapUserToRole, Admin, Scoresheet, ScoresheetEnum
 )
 
@@ -131,11 +131,114 @@ class MappingAPITests(APITestCase):
         self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_201_CREATED])
         self.assertTrue(MapContestToOrganizer.objects.filter(contestid=self.contest.id, organizerid=self.organizer.id).exists())
 
+    def test_unprivileged_user_cannot_change_contest_assignments(self):
+        MapContestToCluster.objects.create(contestid=self.contest.id, clusterid=self.cluster.id)
+        unprivileged_user = User.objects.create_user(
+            username="unprivileged@example.com", password="testpassword"
+        )
+        self.client.force_authenticate(user=unprivileged_user)
+
+        judge_response = self.client.post(
+            reverse('create_contest_judge_mapping'),
+            {"contestid": self.contest.id, "judgeid": self.judge.id},
+        )
+        team_response = self.client.post(
+            reverse('create_contest_team_mapping'),
+            {"contestid": self.contest.id, "teamid": self.team.id},
+        )
+        organizer_response = self.client.post(
+            reverse('create_contest_organizer_mapping'),
+            {"contestid": self.contest.id, "organizerid": self.organizer.id},
+        )
+        cluster_team_response = self.client.post(
+            reverse('create_cluster_team_mapping'),
+            {"clusterid": self.cluster.id, "teamid": self.team.id},
+        )
+        cluster_judge_response = self.client.post(
+            reverse('create_cluster_judge_mapping'),
+            {"clusterid": self.cluster.id, "judgeid": self.judge.id},
+        )
+
+        self.assertEqual(judge_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(team_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(organizer_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(cluster_team_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(cluster_judge_response.status_code, status.HTTP_403_FORBIDDEN)
+
     def test_get_organizers_by_contest_id(self):
+        other_contest = Contest.objects.create(
+            name="Other Contest",
+            date=date.today(),
+            is_open=True,
+            is_tabulated=False,
+        )
+        other_organizer = Organizer.objects.create(
+            first_name="Other", last_name="Organizer"
+        )
+        # Create this mapping first so mapping IDs do not happen to match
+        # organizer IDs. The endpoint must use organizerid, not mapping.id.
+        MapContestToOrganizer.objects.create(
+            contestid=other_contest.id, organizerid=other_organizer.id
+        )
         MapContestToOrganizer.objects.create(contestid=self.contest.id, organizerid=self.organizer.id)
         url = reverse('get_organizers_by_contest_id', args=[self.contest.id])
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [organizer['id'] for organizer in response.data['Organizers']],
+            [self.organizer.id],
+        )
+
+    def test_unprivileged_user_cannot_change_coach_team_mapping(self):
+        MapContestToTeam.objects.create(
+            contestid=self.contest.id, teamid=self.team.id
+        )
+        mapping = MapCoachToTeam.objects.create(
+            teamid=self.team.id, coachid=self.coach.id
+        )
+        unprivileged_user = User.objects.create_user(
+            username="other-user@example.com", password="testpassword"
+        )
+        self.client.force_authenticate(user=unprivileged_user)
+
+        create_response = self.client.post(
+            reverse('create_coach_team_mapping'),
+            {"teamid": self.team.id, "coachid": self.coach.id},
+        )
+        delete_response = self.client.delete(
+            reverse('delete_coach_team_mapping', args=[mapping.id])
+        )
+
+        self.assertEqual(create_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(delete_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(MapCoachToTeam.objects.filter(id=mapping.id).exists())
+
+    def test_assigned_organizer_can_change_coach_team_mapping(self):
+        organizer_user = User.objects.create_user(
+            username="organizer@example.com", password="testpassword"
+        )
+        MapUserToRole.objects.create(
+            uuid=organizer_user.id, role=2, relatedid=self.organizer.id
+        )
+        MapContestToOrganizer.objects.create(
+            contestid=self.contest.id, organizerid=self.organizer.id
+        )
+        MapContestToTeam.objects.create(
+            contestid=self.contest.id, teamid=self.team.id
+        )
+        self.client.force_authenticate(user=organizer_user)
+
+        create_response = self.client.post(
+            reverse('create_coach_team_mapping'),
+            {"teamid": self.team.id, "coachid": self.coach.id},
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_200_OK)
+
+        mapping_id = create_response.data['mapping']['id']
+        delete_response = self.client.delete(
+            reverse('delete_coach_team_mapping', args=[mapping_id])
+        )
+        self.assertEqual(delete_response.status_code, status.HTTP_200_OK)
 
     def test_get_contests_by_organizer_id(self):
         MapContestToOrganizer.objects.create(contestid=self.contest.id, organizerid=self.organizer.id)
@@ -315,6 +418,34 @@ class MappingAPITests(APITestCase):
         response = self.client.post(url, data)
         self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_201_CREATED])
 
+    def test_unprivileged_user_cannot_assign_or_remove_roles(self):
+        target_user = User.objects.create_user(
+            username="target@example.com", password="password"
+        )
+        target_coach = Coach.objects.create(first_name="Target", last_name="Coach")
+        existing_mapping = MapUserToRole.objects.create(
+            uuid=target_user.id, role=4, relatedid=target_coach.id
+        )
+        unprivileged_user = User.objects.create_user(
+            username="unprivileged-role-user@example.com", password="password"
+        )
+        self.client.force_authenticate(user=unprivileged_user)
+
+        create_response = self.client.post(
+            reverse('create_user_role_mapping'),
+            {"uuid": unprivileged_user.id, "role": 1, "relatedid": self.admin.id},
+        )
+        delete_response = self.client.delete(
+            reverse('delete_user_role_mapping', args=[existing_mapping.id])
+        )
+
+        self.assertEqual(create_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(delete_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(
+            MapUserToRole.objects.filter(uuid=unprivileged_user.id, role=1).exists()
+        )
+        self.assertTrue(MapUserToRole.objects.filter(id=existing_mapping.id).exists())
+
     def test_get_user_by_role(self):
         url = reverse('get_user_by_role', args=[self.admin.id, 1])
         response = self.client.get(url)
@@ -323,13 +454,16 @@ class MappingAPITests(APITestCase):
     # Additional mapping tests
     def test_assign_judge_to_contest(self):
         """Test assigning a judge to a contest"""
+        MapContestToCluster.objects.create(contestid=self.contest.id, clusterid=self.cluster.id)
         url = reverse('assign_judge_to_contest')
         data = {
-            "judgeid": self.judge.id,
-            "contestid": self.contest.id
+            "judge_id": self.judge.id,
+            "contest_id": self.contest.id,
+            "cluster_id": self.cluster.id,
+            "presentation": True,
         }
         response = self.client.post(url, data, format='json')
-        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_201_CREATED, status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR])
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
     def test_get_judge_contests(self):
         """Test getting all contests for a judge"""
@@ -345,8 +479,33 @@ class MappingAPITests(APITestCase):
         response = self.client.delete(url)
         self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR])
 
+    def test_removing_judge_keeps_other_contest_assignments(self):
+        other_contest = Contest.objects.create(
+            name="Other Contest", date=date.today(), is_open=True, is_tabulated=False
+        )
+        other_cluster = JudgeClusters.objects.create(cluster_name="Other Cluster")
+        MapContestToCluster.objects.create(contestid=self.contest.id, clusterid=self.cluster.id)
+        MapContestToCluster.objects.create(contestid=other_contest.id, clusterid=other_cluster.id)
+        MapContestToJudge.objects.create(contestid=self.contest.id, judgeid=self.judge.id)
+        MapContestToJudge.objects.create(contestid=other_contest.id, judgeid=self.judge.id)
+        MapJudgeToCluster.objects.create(judgeid=self.judge.id, clusterid=self.cluster.id)
+        MapJudgeToCluster.objects.create(judgeid=self.judge.id, clusterid=other_cluster.id)
+
+        response = self.client.delete(
+            reverse('remove_judge_from_contest', args=[self.judge.id, other_contest.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(MapJudgeToCluster.objects.filter(
+            judgeid=self.judge.id, clusterid=self.cluster.id
+        ).exists())
+        self.assertFalse(MapJudgeToCluster.objects.filter(
+            judgeid=self.judge.id, clusterid=other_cluster.id
+        ).exists())
+
     def test_remove_judge_from_cluster(self):
         """Test removing a judge from a cluster"""
+        MapContestToCluster.objects.create(contestid=self.contest.id, clusterid=self.cluster.id)
         MapJudgeToCluster.objects.create(judgeid=self.judge.id, clusterid=self.cluster.id)
         url = reverse('remove_judge_from_cluster', args=[self.judge.id, self.cluster.id])
         response = self.client.delete(url)
@@ -427,4 +586,3 @@ class MappingAPITests(APITestCase):
         url = reverse('all_submitted_for_team', args=[self.team.id])
         response = self.client.get(url)
         self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR])
-

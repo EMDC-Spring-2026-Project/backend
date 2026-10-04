@@ -375,6 +375,11 @@ def tabulate_scores(request):
     if not contest_id:
         return Response({"detail": "contestid is required"}, status=400)
 
+    if not _ensure_requester_is_organizer_of_contest(request.user, contest_id):
+        return Response(
+            {"detail": "Organizer of this contest required."}, status=status.HTTP_403_FORBIDDEN
+        )
+
     try:
         recompute_totals_and_ranks(contest_id)
         return Response(status=200)
@@ -394,11 +399,25 @@ def preliminary_results(request):
     if not contest_id:
         return Response({"ok": False, "message": "contestid is required."}, status=status.HTTP_400_BAD_REQUEST)
 
+    if not _ensure_requester_is_organizer_of_contest(request.user, contest_id):
+        return Response(
+            {"ok": False, "message": "Organizer of this contest required."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
     # recompute + apply ranks
     recompute_totals_and_ranks(contest_id)
 
     response_clusters = []
     for cm in MapContestToCluster.objects.filter(contestid=contest_id):
+        # Every contest receives an internal "All Teams" cluster at creation.
+        # It is useful for setup, but its members are also assigned to their
+        # actual preliminary clusters. Including it in standings duplicates
+        # every team's result.
+        cluster = JudgeClusters.objects.filter(id=cm.clusterid).first()
+        if cluster and cluster.cluster_name.strip().lower() == "all teams":
+            continue
+
         # teams in this cluster
         team_maps = MapClusterToTeam.objects.filter(clusterid=cm.clusterid)
         cluster_teams = []
@@ -503,6 +522,12 @@ def championship_results(request):
     contest_id = request.GET.get("contestid")
     if not contest_id:
         return Response({"ok": False, "message": "contestid is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not _ensure_requester_is_organizer_of_contest(request.user, contest_id):
+        return Response(
+            {"ok": False, "message": "Organizer of this contest required."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     
     #get championship results
     team_ids = MapContestToTeam.objects.filter(contestid=contest_id).values_list("teamid", flat=True)
@@ -538,12 +563,25 @@ def redesign_results(request):
     contest_id = request.GET.get("contestid")
     if not contest_id:
         return Response({"ok": False, "message": "contestid is required."}, status=status.HTTP_400_BAD_REQUEST)
-    
-    #get redesign results
-    team_ids = MapContestToTeam.objects.filter(contestid=contest_id).values_list("teamid", flat=True)
+
+    if not _ensure_requester_is_organizer_of_contest(request.user, contest_id):
+        return Response(
+            {"ok": False, "message": "Organizer of this contest required."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    redesign_cluster_ids = MapContestToCluster.objects.filter(
+        contestid=contest_id,
+        clusterid__in=JudgeClusters.objects.filter(
+            cluster_type="redesign"
+        ).values_list("id", flat=True),
+    ).values_list("clusterid", flat=True)
+    team_ids = MapClusterToTeam.objects.filter(
+        clusterid__in=redesign_cluster_ids
+    ).values_list("teamid", flat=True)
     redesign_teams = Teams.objects.filter(
         id__in=list(team_ids)
-    ).order_by('-total_score', 'id')
+    ).distinct().order_by('-redesign_score', 'id')
 
     results = []
     for i, team in enumerate(redesign_teams, 1):
@@ -558,4 +596,3 @@ def redesign_results(request):
         })
     
     return Response({"ok": True, "data": results}, status=200)
-

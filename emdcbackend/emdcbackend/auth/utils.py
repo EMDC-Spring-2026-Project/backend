@@ -17,6 +17,23 @@ def send_email_via_resend(to_email, subject, html_content, text_content=None):
         if not html_content:
             raise ValueError("html_content is required")
         
+        # Honor explicitly configured local/test delivery without a Resend account.
+        from django.conf import settings
+        if settings.EMAIL_BACKEND in {
+            "django.core.mail.backends.console.EmailBackend",
+            "django.core.mail.backends.locmem.EmailBackend",
+            "django.core.mail.backends.filebased.EmailBackend",
+            "django.core.mail.backends.dummy.EmailBackend",
+        }:
+            from django.core.mail import EmailMultiAlternatives
+            from django.utils.html import strip_tags
+            message = EmailMultiAlternatives(
+                subject.strip(), text_content or strip_tags(html_content),
+                settings.DEFAULT_FROM_EMAIL, [to_email.strip()],
+            )
+            message.attach_alternative(html_content, "text/html")
+            return message.send()
+
         api_key = os.environ.get("RESEND_API_KEY")
         if not api_key:
             # In test environments, don't fail if API key is missing

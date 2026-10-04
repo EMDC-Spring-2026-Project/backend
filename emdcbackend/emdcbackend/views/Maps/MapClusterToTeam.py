@@ -9,15 +9,39 @@ from rest_framework.response import Response
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from django.shortcuts import get_object_or_404
-from ...models import JudgeClusters, Teams, MapClusterToTeam, MapJudgeToCluster
+from ...models import JudgeClusters, Teams, MapClusterToTeam, MapJudgeToCluster, MapContestToCluster, MapContestToOrganizer, MapUserToRole
 from ...serializers import TeamSerializer, ClusterToTeamSerializer, JudgeClustersSerializer
 from rest_framework.exceptions import ValidationError
+
+
+def _can_manage_cluster(user, cluster_id):
+    if user.is_superuser or MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+    ).exists():
+        return True
+    organizer_ids = list(MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ORGANIZER
+    ).values_list("relatedid", flat=True))
+    contest_ids = set(MapContestToCluster.objects.filter(
+        clusterid=cluster_id
+    ).values_list("contestid", flat=True))
+    if not organizer_ids or not contest_ids:
+        return False
+    managed_contest_ids = set(MapContestToOrganizer.objects.filter(
+        contestid__in=contest_ids, organizerid__in=organizer_ids
+    ).values_list("contestid", flat=True))
+    return contest_ids.issubset(managed_contest_ids)
 
 
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def create_cluster_team_mapping(request):
+    cluster_id = request.data.get("clusterid")
+    if not cluster_id:
+        return Response({"detail": "clusterid is required."}, status=status.HTTP_400_BAD_REQUEST)
+    if not _can_manage_cluster(request.user, cluster_id):
+        return Response({"detail": "You are not allowed to change this cluster."}, status=status.HTTP_403_FORBIDDEN)
     serializer = ClusterToTeamSerializer(data=request.data)
     if serializer.is_valid():
         serializer.save()
@@ -70,6 +94,8 @@ def cluster_by_team_id(request, team_id):
 def delete_cluster_team_mapping_by_id(request, map_id):
     try:
         map_to_delete = get_object_or_404(MapClusterToTeam, id=map_id)
+        if not _can_manage_cluster(request.user, map_to_delete.clusterid):
+            return Response({"detail": "You are not allowed to change this cluster."}, status=status.HTTP_403_FORBIDDEN)
         # teamid on mapping is an integer FK id in our schema; keep it as a raw id
         team_id = map_to_delete.teamid
         map_to_delete.delete()
@@ -91,7 +117,13 @@ def delete_cluster_team_mapping_by_id(request, map_id):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def get_teams_by_cluster_rank(request):
-    mappings = MapClusterToTeam.objects.filter(clusterid=request.data["clusterid"])
+    try:
+        clusterid = int(request.query_params.get("clusterid", ""))
+        if clusterid <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return Response({"detail": "clusterid must be a positive integer"}, status=status.HTTP_400_BAD_REQUEST)
+    mappings = MapClusterToTeam.objects.filter(clusterid=clusterid)
     teams = Teams.objects.filter(
         id__in=mappings.values_list('teamid', flat=True),
         cluster_rank__isnull=False

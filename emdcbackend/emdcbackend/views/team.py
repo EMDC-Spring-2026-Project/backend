@@ -23,6 +23,31 @@ from django.contrib.auth.models import User
 from django.shortcuts import get_object_or_404
 from django.db import transaction
 
+
+def _can_manage_team(user, team_id):
+    contest_ids = list(MapContestToTeam.objects.filter(
+        teamid=team_id
+    ).values_list("contestid", flat=True))
+    # Editing or deleting a team changes the shared team record and related data
+    # for every contest. An organizer must therefore manage every linked contest.
+    return bool(contest_ids) and all(
+        _can_manage_contest(user, contest_id) for contest_id in contest_ids
+    )
+
+
+def _can_manage_contest(user, contest_id):
+    if user.is_superuser or MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+    ).exists():
+        return True
+    organizer_ids = MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ORGANIZER
+    ).values_list("relatedid", flat=True)
+    from ..models import MapContestToOrganizer
+    return MapContestToOrganizer.objects.filter(
+        contestid=contest_id, organizerid__in=organizer_ids
+    ).exists()
+
 # Get team by ID
 @api_view(["GET"])
 def team_by_id(request, team_id):
@@ -45,6 +70,8 @@ def create_team(request):
                 raise ValidationError({"contestid": "Contest ID is required."})
             if "clusterid" not in request.data:
                 raise ValidationError({"clusterid": "Cluster ID is required."})
+            if not _can_manage_contest(request.user, request.data["contestid"]):
+                return Response({"detail": "You cannot manage this contest."}, status=status.HTTP_403_FORBIDDEN)
             
             # Step 1: Create team object
             team_response = make_team(request.data)
@@ -165,6 +192,8 @@ def edit_team(request):
         with transaction.atomic():
             # Retrieve team, coach, and user details
             team = get_object_or_404(Teams, id=request.data["id"])
+            if not _can_manage_team(request.user, team.id):
+                return Response({"detail": "You cannot manage this team."}, status=status.HTTP_403_FORBIDDEN)
             coach_team_mapping = get_object_or_404(MapCoachToTeam, teamid=team.id)
             coach = get_object_or_404(Coach, id=coach_team_mapping.coachid)
             try:
@@ -319,6 +348,8 @@ def delete_team_by_id(request, team_id):
     prevent FK integrity on delete.
     """
     team = get_object_or_404(Teams, id=team_id)
+    if not _can_manage_team(request.user, team.id):
+        return Response({"detail": "You cannot manage this team."}, status=status.HTTP_403_FORBIDDEN)
     try:
         with transaction.atomic():
             # Import here to avoid circulars at module import time
@@ -432,7 +463,13 @@ def make_team(data):
 @authentication_classes([SessionAuthentication]) 
 @permission_classes([IsAuthenticated])
 def get_teams_by_team_rank(request):
-    mappings = MapContestToTeam.objects.filter(contestid=request.data["contestid"])
+    try:
+        contestid = int(request.query_params.get("contestid", ""))
+        if contestid <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return Response({"detail": "contestid must be a positive integer"}, status=status.HTTP_400_BAD_REQUEST)
+    mappings = MapContestToTeam.objects.filter(contestid=contestid)
     teams = Teams.objects.filter(id__in=mappings.values_list('teamid', flat=True,),team_rank__isnull=False).order_by('team_rank')
     serializer = TeamSerializer(teams, many=True)
     return Response({"Teams": serializer.data}, status=status.HTTP_200_OK)

@@ -3,7 +3,7 @@ from rest_framework.test import APITestCase
 from rest_framework import status
 from django.contrib.auth.models import User
 from datetime import date
-from ..models import Contest, JudgeClusters, MapContestToCluster
+from ..models import Admin, Contest, JudgeClusters, MapContestToCluster, MapUserToRole
 from ..serializers import ContestSerializer
 
 
@@ -12,6 +12,12 @@ class ContestAPITests(APITestCase):
         # Create a user and login using session authentication
         self.user = User.objects.create_user(username="testuser@example.com", password="testpassword")
         self.client.login(username="testuser@example.com", password="testpassword")
+        self.admin = Admin.objects.create(first_name="Test", last_name="Administrator")
+        MapUserToRole.objects.create(
+            uuid=self.user.id,
+            role=MapUserToRole.RoleEnum.ADMIN,
+            relatedid=self.admin.id,
+        )
 
     def test_contest_by_id(self):
         contest = Contest.objects.create(
@@ -79,3 +85,26 @@ class ContestAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertFalse(Contest.objects.filter(id=contest.id).exists())
 
+    def test_unprivileged_user_cannot_manage_contests(self):
+        contest = Contest.objects.create(
+            name="Protected Contest", date=date.today(), is_open=False, is_tabulated=False
+        )
+        unprivileged_user = User.objects.create_user(
+            username="judge@example.com", password="testpassword"
+        )
+        self.client.force_authenticate(user=unprivileged_user)
+
+        create_response = self.client.post(
+            reverse('create_contest'), {"name": "Unauthorized", "date": str(date.today())}
+        )
+        edit_response = self.client.post(
+            reverse('edit_contest'),
+            {"id": contest.id, "name": "Changed", "date": str(date.today()), "is_open": True, "is_tabulated": False},
+        )
+        delete_response = self.client.delete(reverse('delete_contest', args=[contest.id]))
+
+        self.assertEqual(create_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(edit_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(delete_response.status_code, status.HTTP_403_FORBIDDEN)
+        contest.refresh_from_db()
+        self.assertEqual(contest.name, "Protected Contest")

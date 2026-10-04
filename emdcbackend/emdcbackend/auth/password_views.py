@@ -148,8 +148,7 @@ def request_password_reset(request):
     except User.DoesNotExist:
         # Return generic message to avoid user enumeration
         return Response({
-            "detail": "If this email belongs to an admin or coach, a reset link has been sent.",
-            "error": "User not found or not authorized for password reset."
+            "detail": "If this email belongs to an admin or coach, a reset link has been sent."
         }, status=status.HTTP_200_OK)
     
     # Check if user is an admin (role = 1) or coach (role = 4)
@@ -157,17 +156,15 @@ def request_password_reset(request):
     try:
         user_role_mapping = MapUserToRole.objects.get(uuid=user.id)
         if user_role_mapping.role not in [1, 4]:  # 1 = ADMIN, 4 = COACH
-            # User is not an admin or coach - tell them to contact admin
             return Response({
-                "detail": "Password reset is only available for administrators and coaches. Please contact an administrator for assistance.",
-                "error": "Only admins and coaches can reset passwords."
-            }, status=status.HTTP_403_FORBIDDEN)
+                "detail": "If this email belongs to an admin or coach, a reset link has been sent."
+            }, status=status.HTTP_200_OK)
     except MapUserToRole.DoesNotExist:
-        # User has no role mapping - not authorized
+        # Use the same response as an unknown address so this public endpoint does
+        # not reveal which email addresses have accounts.
         return Response({
-            "detail": "Password reset is only available for administrators and coaches. Please contact an administrator for assistance.",
-            "error": "User role not found."
-        }, status=status.HTTP_403_FORBIDDEN)
+            "detail": "If this email belongs to an admin or coach, a reset link has been sent."
+        }, status=status.HTTP_200_OK)
     
     # User is an admin or coach - send reset email
     url = build_set_password_url(user)

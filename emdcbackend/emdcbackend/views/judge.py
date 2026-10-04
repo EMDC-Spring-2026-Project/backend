@@ -18,7 +18,7 @@ from .scoresheets import create_sheets_for_teams_in_cluster, delete_sheets_for_t
 from ..auth.views import create_user
 from ..models import (
     Judge, Scoresheet, MapScoresheetToTeamJudge, MapJudgeToCluster,
-    Teams, MapContestToJudge, MapUserToRole, JudgeClusters
+    Teams, MapContestToJudge, MapContestToOrganizer, MapUserToRole, JudgeClusters
 )
 from ..serializers import JudgeSerializer
 from ..auth.serializers import UserSerializer
@@ -46,6 +46,35 @@ def _delete_user_sessions(user_id: int) -> None:
         pass
 
 
+def _can_manage_contest(user, contest_id):
+    """Return whether the user can manage people assigned to this contest."""
+    if user.is_superuser or MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+    ).exists():
+        return True
+
+    organizer_ids = MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ORGANIZER
+    ).values_list("relatedid", flat=True)
+    return MapContestToOrganizer.objects.filter(
+        contestid=contest_id, organizerid__in=organizer_ids
+    ).exists()
+
+
+def _can_manage_judge(user, judge_id):
+    if user.is_superuser or MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+    ).exists():
+        return True
+    contest_ids = list(MapContestToJudge.objects.filter(
+        judgeid=judge_id
+    ).values_list("contestid", flat=True))
+    # Judge profile changes and deletion affect all contest assignments.
+    return bool(contest_ids) and all(
+        _can_manage_contest(user, contest_id) for contest_id in contest_ids
+    )
+
+
 @api_view(["GET"])
 def judge_by_id(request, judge_id):
     judge = get_object_or_404(Judge, id=judge_id)
@@ -59,6 +88,12 @@ def judge_by_id(request, judge_id):
 @permission_classes([IsAuthenticated])
 def create_judge(request):
     try:
+        contest_id = request.data.get("contestid")
+        if not contest_id:
+            return Response({"detail": "contestid is required."}, status=status.HTTP_400_BAD_REQUEST)
+        if not _can_manage_contest(request.user, contest_id):
+            return Response({"detail": "You are not allowed to manage judges for this contest."}, status=status.HTTP_403_FORBIDDEN)
+
         with transaction.atomic():
             user_response, judge_response = create_user_and_judge(request.data)
 
@@ -72,7 +107,7 @@ def create_judge(request):
                 raise ValidationError('Failed to create judge role mapping.')
 
             contest_mapping = create_contest_to_judge_map({
-                "contestid": request.data["contestid"],
+                "contestid": contest_id,
                 "judgeid": judge_response.get("id")
             })
             if isinstance(contest_mapping, Response):
@@ -178,6 +213,8 @@ def _get_delete_flags_for_cluster_type(cluster_id):
 def edit_judge(request):
     try:
         judge = get_object_or_404(Judge, id=request.data["id"])
+        if not _can_manage_judge(request.user, judge.id):
+            return Response({"detail": "You are not allowed to manage this judge."}, status=status.HTTP_403_FORBIDDEN)
 
         cluster_entries = request.data.get("clusters")
         if cluster_entries and isinstance(cluster_entries, list):
@@ -347,6 +384,8 @@ def edit_judge(request):
 def delete_judge(request, judge_id):
     try:
         judge = get_object_or_404(Judge, id=judge_id)
+        if not _can_manage_judge(request.user, judge.id):
+            return Response({"detail": "You are not allowed to manage this judge."}, status=status.HTTP_403_FORBIDDEN)
         scoresheet_mappings = MapScoresheetToTeamJudge.objects.filter(judgeid=judge_id)
         scoresheet_ids = scoresheet_mappings.values_list('scoresheetid', flat=True)
         scoresheets = Scoresheet.objects.filter(id__in=scoresheet_ids)
@@ -505,7 +544,21 @@ def are_all_score_sheets_submitted(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def judge_disqualify_team(request):
-    team = get_object_or_404(Teams, id=request.data["teamid"])
+    team_id = request.data.get("teamid")
+    if team_id is None or "judge_disqualified" not in request.data:
+        return Response({"detail": "teamid and judge_disqualified are required."}, status=status.HTTP_400_BAD_REQUEST)
+    team = get_object_or_404(Teams, id=team_id)
+    is_admin = request.user.is_superuser or MapUserToRole.objects.filter(
+        uuid=request.user.id, role=MapUserToRole.RoleEnum.ADMIN
+    ).exists()
+    judge_ids = MapUserToRole.objects.filter(
+        uuid=request.user.id, role=MapUserToRole.RoleEnum.JUDGE
+    ).values_list("relatedid", flat=True)
+    is_assigned_judge = MapScoresheetToTeamJudge.objects.filter(
+        teamid=team.id, judgeid__in=judge_ids
+    ).exists()
+    if not is_admin and not is_assigned_judge:
+        return Response({"detail": "You are not allowed to disqualify this team."}, status=status.HTTP_403_FORBIDDEN)
     team.judge_disqualified = request.data["judge_disqualified"]
     team.save()
     return Response(status=status.HTTP_200_OK)

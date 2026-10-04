@@ -2,7 +2,11 @@ from django.urls import reverse
 from rest_framework.test import APITestCase
 from rest_framework import status
 from django.contrib.auth.models import User
-from ..models import SpecialAward, Teams, Admin, MapUserToRole
+from datetime import date
+from ..models import (
+    SpecialAward, Teams, Admin, Organizer, Judge, Contest, MapUserToRole,
+    MapContestToOrganizer, MapContestToJudge, MapContestToTeam,
+)
 
 
 class AwardAPITests(APITestCase):
@@ -82,3 +86,85 @@ class AwardAPITests(APITestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+    def test_unprivileged_user_cannot_change_awards(self):
+        award = SpecialAward.objects.create(
+            teamid=self.team.id, award_name="Protected Award", isJudge=False
+        )
+        unprivileged_user = User.objects.create_user(
+            username="ordinary@example.com", password="testpassword"
+        )
+        self.client.force_authenticate(user=unprivileged_user)
+
+        create_response = self.client.post(
+            reverse('create_award_team_mapping'),
+            {"teamid": 0, "award_name": "Unauthorized Award", "isJudge": False},
+        )
+        update_response = self.client.put(
+            reverse(
+                'update_award_team_mapping',
+                args=[award.teamid, award.award_name],
+            ),
+            {"teamid": self.team.id, "award_name": "Changed", "isJudge": False},
+            format='json',
+        )
+        delete_response = self.client.delete(
+            reverse(
+                'delete_award_team_mapping_by_id',
+                args=[award.teamid, award.award_name],
+            )
+        )
+
+        self.assertEqual(create_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(update_response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(delete_response.status_code, status.HTTP_403_FORBIDDEN)
+        award.refresh_from_db()
+        self.assertEqual(award.award_name, "Protected Award")
+
+    def test_judge_can_assign_judge_award_only_within_assigned_contest(self):
+        contest = Contest.objects.create(
+            name="Judge Contest", date=date.today(), is_open=True, is_tabulated=False
+        )
+        other_contest = Contest.objects.create(
+            name="Other Contest", date=date.today(), is_open=True, is_tabulated=False
+        )
+        other_team = Teams.objects.create(team_name="Other Team")
+        MapContestToTeam.objects.create(contestid=contest.id, teamid=self.team.id)
+        MapContestToTeam.objects.create(contestid=other_contest.id, teamid=other_team.id)
+        judge = Judge.objects.create(
+            first_name="Award",
+            last_name="Judge",
+            phone_number="5551234567",
+            contestid=contest.id,
+            presentation=True,
+            journal=True,
+            mdo=False,
+        )
+        judge_user = User.objects.create_user(
+            username="award-judge@example.com", password="testpassword"
+        )
+        MapUserToRole.objects.create(uuid=judge_user.id, role=3, relatedid=judge.id)
+        MapContestToJudge.objects.create(contestid=contest.id, judgeid=judge.id)
+        judge_award = SpecialAward.objects.create(
+            teamid=0, award_name="Judge Choice", isJudge=True
+        )
+        self.client.force_authenticate(user=judge_user)
+
+        allowed_response = self.client.put(
+            reverse(
+                'update_award_team_mapping',
+                args=[judge_award.teamid, judge_award.award_name],
+            ),
+            {"teamid": self.team.id, "award_name": judge_award.award_name, "isJudge": True},
+            format='json',
+        )
+        self.assertEqual(allowed_response.status_code, status.HTTP_200_OK)
+
+        denied_response = self.client.put(
+            reverse(
+                'update_award_team_mapping',
+                args=[self.team.id, judge_award.award_name],
+            ),
+            {"teamid": other_team.id, "award_name": judge_award.award_name, "isJudge": True},
+            format='json',
+        )
+        self.assertEqual(denied_response.status_code, status.HTTP_403_FORBIDDEN)

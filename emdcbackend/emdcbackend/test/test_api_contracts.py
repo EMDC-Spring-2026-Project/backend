@@ -186,6 +186,7 @@ class APIContractTests(APITestCase):
         coach_user = User.objects.create_user(username="coachuser@example.com", password="password")
         MapUserToRole.objects.create(uuid=coach_user.id, role=4, relatedid=coach.id)
         MapCoachToTeam.objects.create(teamid=team.id, coachid=coach.id)
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=team.id)
         
         url = reverse('edit_team')
         # Successful update
@@ -223,6 +224,7 @@ class APIContractTests(APITestCase):
             total_score=255.0,
             championship_score=0.0
         )
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=team.id)
         
         url = reverse('delete_team_by_id', kwargs={'team_id': team.id})
         response = self.client.delete(url)
@@ -373,4 +375,3 @@ class APIContractTests(APITestCase):
             # If paginated, should have pagination metadata
             # Otherwise, just verify it's a valid response
             self.assertIsInstance(response.data, dict)
-

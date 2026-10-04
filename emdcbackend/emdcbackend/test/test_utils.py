@@ -261,10 +261,11 @@ class BuildSetPasswordUrlTests(TestCase):
     
     def test_build_set_password_url_uses_settings(self):
         """Test that URL uses FRONTEND_BASE_URL from settings"""
-        from django.conf import settings
+        import os
+        from unittest.mock import patch
         from django.test import override_settings
-        
-        with override_settings(FRONTEND_BASE_URL="https://custom-frontend.com"):
+
+        with patch.dict(os.environ, {"FRONTEND_BASE_URL": ""}), override_settings(FRONTEND_BASE_URL="https://custom-frontend.com"):
             url = build_set_password_url(self.user)
             self.assertIn("https://custom-frontend.com", url)
     

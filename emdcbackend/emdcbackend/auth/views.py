@@ -50,8 +50,6 @@ def parse_body(request):
 @csrf_exempt  # CSRF is handled via credentials here; also enables cross-domain frontend login
 @ensure_csrf_cookie
 @require_POST
-@csrf_exempt
-@require_POST
 def login_view(request):
     body = parse_body(request)
     username = body.get("username")
@@ -100,8 +98,16 @@ def login_view(request):
     if not user:
         return JsonResponse({"detail": "Invalid credentials"}, status=401)
 
+    try:
+        role = get_role(user.id)
+    except ValidationError:
+        # Accounts without an EMDC role cannot use a dashboard. Return a clear
+        # response rather than turning this data-integrity issue into a 500.
+        return JsonResponse({
+            "detail": "This account has not been assigned a contest role. Please contact an administrator."
+        }, status=403)
+
     dj_login(request, user)  # sets the Django session HttpOnly cookie
-    role = get_role(user.id)
 
     return JsonResponse({"user": {"id": user.id, "username": user.username}, "role": role})
 
@@ -129,37 +135,57 @@ def csrf_view(request):
 # User queries / auth
 # -----------------------
 
+def _can_manage_user(request_user, target_user_id):
+    """Return whether a user may view or change the requested account."""
+    return (
+        request_user.is_superuser
+        or request_user.id == target_user_id
+        or MapUserToRole.objects.filter(uuid=request_user.id, role=1).exists()
+    )
+
+
 @api_view(["GET"])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
 def user_by_id(request, user_id):
+    if not _can_manage_user(request.user, user_id):
+        return Response(
+            {"detail": "You do not have permission to view this user."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     user = get_object_or_404(User, id=user_id)
     serializer = UserSerializer(instance=user)
     return Response({"user": serializer.data}, status=status.HTTP_200_OK)
 
 
 @api_view(["POST"])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
 def signup(request):
     """
-    Public sign-up. Preserves your original semantics:
-      - If username exists: return existing user's data.
-      - Otherwise create user, set password, and send set-password email.
-    Uses session-based authentication (no tokens returned).
-    Additionally enforces STRICT email format and emails a set-password link.
+    Create an account from an authenticated administrator session.
+
+    Public self-registration cannot assign an EMDC role and therefore creates an
+    unusable account. Staff accounts should normally be created through the role
+    management endpoints, which create the account and role together.
     """
+    if not _can_manage_user(request.user, -1):
+        return Response(
+            {"detail": "Administrator access required."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     try:
         user_data = request.data
         username = user_data.get("username")
         if not username:
             return Response({"detail": "username is required"}, status=status.HTTP_400_BAD_REQUEST)
 
-        #  if user exists (case-insensitive), return 200 with existing user
+        # Do not return another account's details from an account-creation request.
         existing = User.objects.filter(username__iexact=username).first()
         if existing:
             return Response(
-                {
-                    "user": UserSerializer(instance=existing).data,
-                    "message": "User already exists",
-                },
-                status=status.HTTP_200_OK,
+                {"detail": "An account with this email already exists."},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         result = create_user(user_data, send_email=True, enforce_unusable_password=False)
@@ -174,6 +200,11 @@ def signup(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def delete_user_by_id(request, user_id):
+    if not _can_manage_user(request.user, user_id):
+        return Response(
+            {"detail": "You do not have permission to delete this user."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     delete_user(user_id)
     return Response({"detail": "User deleted successfully."}, status=status.HTTP_200_OK)
 
@@ -186,7 +217,16 @@ def edit_user(request):
     Allows changing username (email) and/or password for the current user.
     Adds STRICT email validation on username change.
     """
-    user = get_object_or_404(User, id=request.data["id"])
+    user_id = request.data.get("id")
+    if user_id is None:
+        return Response({"detail": "id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    user = get_object_or_404(User, id=user_id)
+    if not _can_manage_user(request.user, user.id):
+        return Response(
+            {"detail": "You do not have permission to edit this user."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     # Update username (email) with strict validation
     new_username = request.data.get("username")
@@ -196,13 +236,21 @@ def edit_user(request):
         except DjangoValidationError:
             return Response({"detail": "Enter a valid email address."}, status=status.HTTP_400_BAD_REQUEST)
 
-        if User.objects.filter(username=new_username).exists():
+        if User.objects.filter(username__iexact=new_username).exclude(id=user.id).exists():
             return Response({"detail": "Email already taken."}, status=status.HTTP_400_BAD_REQUEST)
         user.username = new_username
 
     # Update password (only if provided)
     new_password = request.data.get("password")
     if new_password:
+        from django.contrib.auth.password_validation import validate_password
+        try:
+            validate_password(new_password, user=user)
+        except DjangoValidationError as exc:
+            return Response(
+                {"password": list(exc.messages)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         user.set_password(new_password)
 
     user.save()

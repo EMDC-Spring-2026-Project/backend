@@ -65,6 +65,16 @@ class ScoresheetAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['ScoreSheet']['sheetType'], ScoresheetEnum.PRESENTATION)
 
+    def test_scores_by_id_requires_sign_in(self):
+        scoresheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=False
+        )
+        self.client.logout()
+
+        response = self.client.get(reverse('scores_by_id', args=[scoresheet.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
     def test_create_score_sheet(self):
         url = reverse('create_score_sheets')
         data = {
@@ -187,6 +197,43 @@ class ScoresheetAPITests(APITestCase):
         # Should return 200 or error
         self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR])
 
+    def test_unassigned_judge_cannot_edit_scoresheet(self):
+        """A judge may only edit scoresheets assigned to that judge."""
+        scoresheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=False, field1=10.0
+        )
+        MapScoresheetToTeamJudge.objects.create(
+            teamid=self.team.id,
+            judgeid=self.judge.id,
+            scoresheetid=scoresheet.id,
+            sheetType=ScoresheetEnum.PRESENTATION,
+        )
+        other_user = User.objects.create_user(
+            username="other-judge@example.com", password="testpassword"
+        )
+        other_judge = Judge.objects.create(
+            first_name="Other",
+            last_name="Judge",
+            phone_number="0987654321",
+            contestid=self.contest.id,
+        )
+        MapUserToRole.objects.create(
+            uuid=other_user.id,
+            role=MapUserToRole.RoleEnum.JUDGE,
+            relatedid=other_judge.id,
+        )
+        self.client.force_authenticate(user=other_user)
+
+        response = self.client.post(
+            reverse('update_scores'),
+            {"id": scoresheet.id, "field1": 99.0},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        scoresheet.refresh_from_db()
+        self.assertEqual(scoresheet.field1, 10.0)
+
     def test_get_scoresheet_details_by_team(self):
         """Test getting scoresheet details for a team"""
         scoresheet = Scoresheet.objects.create(
@@ -245,4 +292,3 @@ class ScoresheetAPITests(APITestCase):
         except KeyError:
             # Expected due to implementation bug
             self.skipTest("Endpoint has implementation issue: GET request accessing request.data")
-
