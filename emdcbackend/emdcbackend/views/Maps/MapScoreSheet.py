@@ -9,8 +9,71 @@ from rest_framework.response import Response
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from django.shortcuts import get_object_or_404
-from ...models import MapScoresheetToTeamJudge, Scoresheet, MapContestToJudge, MapJudgeToCluster, MapClusterToTeam, MapContestToCluster
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
+from ...models import (
+    MapScoresheetToTeamJudge,
+    Scoresheet,
+    MapContestToJudge,
+    MapJudgeToCluster,
+    MapClusterToTeam,
+    MapContestToCluster,
+    MapContestToTeam,
+    MapContestToOrganizer,
+    MapUserToRole,
+)
 from ...serializers import MapScoreSheetToTeamJudgeSerializer, ScoresheetSerializer
+
+
+def _is_admin(user):
+    return user.is_superuser or MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+    ).exists()
+
+
+def _can_manage_team(user, team_id):
+    if _is_admin(user):
+        return True
+
+    organizer_ids = list(MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ORGANIZER
+    ).values_list("relatedid", flat=True))
+    contest_ids = set(MapContestToTeam.objects.filter(
+        teamid=team_id
+    ).values_list("contestid", flat=True))
+    if not organizer_ids or not contest_ids:
+        return False
+
+    managed_contest_ids = set(MapContestToOrganizer.objects.filter(
+        contestid__in=contest_ids, organizerid__in=organizer_ids
+    ).values_list("contestid", flat=True))
+    return contest_ids.issubset(managed_contest_ids)
+
+
+def _judge_role_matches(user, judge_id):
+    return MapUserToRole.objects.filter(
+        uuid=user.id,
+        role=MapUserToRole.RoleEnum.JUDGE,
+        relatedid=judge_id,
+    ).exists()
+
+
+def _can_manage_contest(user, contest_id):
+    if _is_admin(user):
+        return True
+    organizer_ids = MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ORGANIZER
+    ).values_list("relatedid", flat=True)
+    return MapContestToOrganizer.objects.filter(
+        contestid=contest_id, organizerid__in=organizer_ids
+    ).exists()
+
+
+def _can_read_judge_mappings(user, judge_id, mappings):
+    if _is_admin(user) or _judge_role_matches(user, judge_id):
+        return True
+    team_ids = set(mappings.values_list("teamid", flat=True))
+    return bool(team_ids) and all(_can_manage_team(user, team_id) for team_id in team_ids)
 
 
 @api_view(["POST"])
@@ -18,6 +81,16 @@ from ...serializers import MapScoreSheetToTeamJudgeSerializer, ScoresheetSeriali
 @permission_classes([IsAuthenticated])
 def create_score_sheet_mapping(request):
     try:
+        team_id = request.data.get("teamid")
+        if team_id is None:
+            return Response(
+                {"detail": "teamid is required."}, status=status.HTTP_400_BAD_REQUEST
+            )
+        if not _can_manage_team(request.user, team_id):
+            return Response(
+                {"detail": "You cannot create scoresheet mappings for this team."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         result = map_score_sheet(request.data)
         return Response(result, status=status.HTTP_201_CREATED)
 
@@ -33,6 +106,11 @@ def create_score_sheet_mapping(request):
 @permission_classes([IsAuthenticated])
 def score_sheet_by_judge_team(request, judge_id, team_id, sheetType):
     try:
+        if not (_judge_role_matches(request.user, judge_id) or _can_manage_team(request.user, team_id)):
+            return Response(
+                {"detail": "You cannot view this scoresheet."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         # Get all mappings for this specific team/judge/sheetType combination
         mappings = MapScoresheetToTeamJudge.objects.filter(
             judgeid=judge_id, 
@@ -100,6 +178,12 @@ def score_sheets_by_judge(request, judge_id):
     try:
         # Fetch mappings for the given judge
         mappings = MapScoresheetToTeamJudge.objects.filter(judgeid=judge_id)
+
+        if not _can_read_judge_mappings(request.user, judge_id, mappings):
+            return Response(
+                {"detail": "You cannot view scoresheets for this judge."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         if not mappings.exists():
             # Return empty list instead of 404 to simplify client handling
@@ -178,6 +262,12 @@ def score_sheets_by_judge_and_cluster(request, judge_id, cluster_id):
             teamid__in=team_ids
         )
 
+        if not _can_read_judge_mappings(request.user, judge_id, mappings):
+            return Response(
+                {"detail": "You cannot view scoresheets for this judge."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         if not mappings.exists():
             # Return empty list instead of 404 to simplify client handling
             return Response({"ScoreSheets": []}, status=status.HTTP_200_OK)
@@ -232,9 +322,25 @@ def all_sheets_submitted_for_contests(request):
     contests = request.data
     results = {}
 
+    if not isinstance(contests, list) or not all(
+        isinstance(contest, dict)
+        and isinstance(contest.get("id"), int)
+        and contest["id"] > 0
+        for contest in contests
+    ):
+        return Response(
+            {"detail": "Request body must be a list of contests with positive integer id values."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     try:
         for contest in contests:
             contest_id = contest.get('id')
+            if not _can_manage_contest(request.user, contest_id):
+                return Response(
+                    {"detail": "You cannot view submission status for this contest."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
             
             # Get all clusters for this contest
             contest_cluster_mappings = MapContestToCluster.objects.filter(contestid=contest_id)
@@ -311,21 +417,40 @@ def all_sheets_submitted_for_contests(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def submit_all_penalty_sheets_for_judge(request):
+    judge_id = request.data.get("judge_id")
+    if judge_id is None:
+        return Response(
+            {"detail": "judge_id is required."}, status=status.HTTP_400_BAD_REQUEST
+        )
+
     try:
-        penalty_mappings = MapScoresheetToTeamJudge.objects.filter(judgeid=request.data["judge_id"], sheetType=4)
+        penalty_mappings = MapScoresheetToTeamJudge.objects.filter(judgeid=judge_id, sheetType=4)
 
         if not penalty_mappings.exists():
             return Response({"error": "No penalty score sheets found for the provided judge."},
                             status=status.HTTP_404_NOT_FOUND)
 
-        for mapping in penalty_mappings:
-            scoresheet = get_object_or_404(Scoresheet, id=mapping.scoresheetid)
+        team_ids = set(penalty_mappings.values_list("teamid", flat=True))
+        can_submit = _is_admin(request.user) or _judge_role_matches(request.user, judge_id)
+        if not can_submit:
+            can_submit = all(_can_manage_team(request.user, team_id) for team_id in team_ids)
+        if not can_submit:
+            return Response(
+                {"detail": "You cannot submit penalty scoresheets for this judge."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
-            scoresheet.isSubmitted = True
-            scoresheet.save()
+        with transaction.atomic():
+            for mapping in penalty_mappings:
+                scoresheet = get_object_or_404(Scoresheet, id=mapping.scoresheetid)
+                scoresheet.isSubmitted = True
+                scoresheet.save()
 
         return Response(status=status.HTTP_200_OK)
 
+    except DjangoValidationError as e:
+        details = e.message_dict if hasattr(e, "message_dict") else e.messages
+        return Response({"errors": details}, status=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -334,6 +459,11 @@ def submit_all_penalty_sheets_for_judge(request):
 @permission_classes([IsAuthenticated])
 def delete_score_sheet_mapping_by_id(request, map_id):
     map_to_delete = get_object_or_404(MapScoresheetToTeamJudge, id=map_id)
+    if not _can_manage_team(request.user, map_to_delete.teamid):
+        return Response(
+            {"detail": "You cannot delete scoresheet mappings for this team."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     map_to_delete.delete()
     return Response({"detail": "Mapping deleted successfully."}, status=status.HTTP_200_OK)
 
@@ -376,6 +506,11 @@ def map_score_sheets_for_team_in_cluster(team_id, cluster_id):
 @permission_classes([IsAuthenticated])
 def all_submitted_for_team(request, team_id: int):
     try:
+        if not _can_manage_team(request.user, team_id):
+            return Response(
+                {"detail": "You cannot view submission status for this team."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         mappings = MapScoresheetToTeamJudge.objects.filter(teamid=team_id)
         total = mappings.count()
         if total == 0:

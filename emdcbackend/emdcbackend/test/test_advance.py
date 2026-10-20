@@ -76,13 +76,9 @@ class AdvanceAPITests(APITestCase):
             "championship_team_ids": [self.team.id]
         }
         response = self.client.post(url, data, format='json')
-        # Should succeed if clusters are set up correctly
-        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR])
-        
-        if response.status_code == status.HTTP_200_OK:
-            self.team.refresh_from_db()
-            # Team should be marked as advanced
-            self.assertTrue(self.team.advanced_to_championship)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.team.refresh_from_db()
+        self.assertTrue(self.team.advanced_to_championship)
 
     def test_advance_to_championship_missing_contestid(self):
         """Test advance_to_championship with missing contestid"""
@@ -118,6 +114,25 @@ class AdvanceAPITests(APITestCase):
         response = self.client.post(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_missing_championship_cluster_does_not_change_team_state(self):
+        self.team.advanced_to_championship = True
+        self.team.championship_rank = 1
+        self.team.save()
+        MapContestToCluster.objects.filter(
+            contestid=self.contest.id, clusterid=self.championship_cluster.id
+        ).delete()
+
+        response = self.client.post(
+            reverse('advance_to_championship'),
+            {"contestid": self.contest.id, "championship_team_ids": []},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.team.refresh_from_db()
+        self.assertTrue(self.team.advanced_to_championship)
+        self.assertEqual(self.team.championship_rank, 1)
+
     def test_undo_championship_advancement(self):
         """Test undoing championship advancement"""
         # First advance a team
@@ -127,13 +142,9 @@ class AdvanceAPITests(APITestCase):
         url = reverse('undo_championship_advancement')
         data = {"contestid": self.contest.id}
         response = self.client.post(url, data, format='json')
-        # Should succeed if clusters are set up correctly
-        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR])
-        
-        if response.status_code == status.HTTP_200_OK:
-            self.team.refresh_from_db()
-            # Team should no longer be advanced
-            self.assertFalse(self.team.advanced_to_championship)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.team.refresh_from_db()
+        self.assertFalse(self.team.advanced_to_championship)
 
     def test_undo_championship_advancement_missing_contestid(self):
         """Test undo_championship_advancement with missing contestid"""
@@ -152,4 +163,3 @@ class AdvanceAPITests(APITestCase):
         data = {"contestid": self.contest.id}
         response = self.client.post(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-

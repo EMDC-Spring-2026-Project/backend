@@ -175,7 +175,7 @@ urlpatterns = [
 
     path('api/mapping/scoreSheet/create/', create_score_sheet_mapping, name='create_score_sheet_mapping'),
     path('api/mapping/scoreSheet/getByTeamJudge/<int:sheetType>/<int:judge_id>/<int:team_id>/', score_sheet_by_judge_team, name='score_sheets_by_judge_team'),
-    path('api/mapping/scoreSheet/delete/', delete_score_sheet_mapping_by_id, name='delete_score_sheet_mapping_by_id'),
+    path('api/mapping/scoreSheet/delete/<int:map_id>/', delete_score_sheet_mapping_by_id, name='delete_score_sheet_mapping_by_id'),
     path('api/mapping/scoreSheet/getSheetsByJudge/<int:judge_id>/', score_sheets_by_judge, name='score_sheets_by_judge'),
     path('api/mapping/scoreSheet/getSheetsByJudgeAndCluster/<int:judge_id>/<int:cluster_id>/', score_sheets_by_judge_and_cluster, name='score_sheets_by_judge_and_cluster'),
     path('api/mapping/scoreSheet/submitAllPenalties/', submit_all_penalty_sheets_for_judge, name='submit_all_penalty_sheets_for_judge'),

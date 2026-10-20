@@ -49,6 +49,21 @@ def _organizer_can_manage_team(user, team_id):
     return contest_ids.issubset(managed_contest_ids)
 
 
+def _judge_can_manage_team(user, team_id):
+    judge_ids = _role_ids(user, MapUserToRole.RoleEnum.JUDGE)
+    if team_id == 0:
+        return judge_ids.exists()
+    team_contest_ids = set(MapContestToTeam.objects.filter(
+        teamid=team_id
+    ).values_list("contestid", flat=True))
+    if not team_contest_ids:
+        return False
+    judge_contest_ids = set(MapContestToJudge.objects.filter(
+        judgeid__in=judge_ids
+    ).values_list("contestid", flat=True))
+    return team_contest_ids.issubset(judge_contest_ids)
+
+
 def _judge_can_assign_award(user, award, new_data):
     if not award.isJudge:
         return False
@@ -59,13 +74,10 @@ def _judge_can_assign_award(user, award, new_data):
     team_id = new_data.get("teamid", award.teamid)
     if not team_id:
         return False
-    judge_contest_ids = set(MapContestToJudge.objects.filter(
-        judgeid__in=_role_ids(user, MapUserToRole.RoleEnum.JUDGE)
-    ).values_list("contestid", flat=True))
-    team_contest_ids = set(MapContestToTeam.objects.filter(
-        teamid=team_id
-    ).values_list("contestid", flat=True))
-    return bool(team_contest_ids) and team_contest_ids.issubset(judge_contest_ids)
+    return (
+        _judge_can_manage_team(user, award.teamid)
+        and _judge_can_manage_team(user, team_id)
+    )
 
 # POST request to create a new award team map
 # Accepts JSON data if data is valid create map if not return 400/500 error 
@@ -140,7 +152,10 @@ def update_award_team_mapping(request, team_id, award_name):
         target_team_id = request.data.get("teamid", award.teamid)
         can_manage = (
             _is_admin(request.user)
-            or _organizer_can_manage_team(request.user, target_team_id)
+            or (
+                _organizer_can_manage_team(request.user, award.teamid)
+                and _organizer_can_manage_team(request.user, target_team_id)
+            )
             or _judge_can_assign_award(request.user, award, request.data)
         )
         if not can_manage:

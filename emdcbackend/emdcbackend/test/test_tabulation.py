@@ -6,7 +6,8 @@ from datetime import date
 from ..models import (
     Contest, Teams, Judge, JudgeClusters, MapContestToTeam, MapContestToOrganizer,
     MapUserToRole, Organizer, Admin, MapClusterToTeam, MapJudgeToCluster,
-    Scoresheet, ScoresheetEnum, MapScoresheetToTeamJudge, MapContestToCluster
+    Scoresheet, ScoresheetEnum, MapScoresheetToTeamJudge, MapContestToCluster,
+    MapContestToJudge,
 )
 
 
@@ -55,8 +56,41 @@ class TabulationAPITests(APITestCase):
         }
         # Use PUT method (as per view decorator)
         response = self.client.put(url, data, format='json')
-        # Note: This might return 200 or 500 depending on scoresheet setup
-        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_500_INTERNAL_SERVER_ERROR])
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    def test_tabulation_ignores_scores_from_judge_not_assigned_to_contest(self):
+        other_contest = Contest.objects.create(
+            name="Other Contest", date=date.today(), is_open=True, is_tabulated=False
+        )
+        other_judge = Judge.objects.create(
+            first_name="Other", last_name="Judge", phone_number="5553334444",
+            contestid=other_contest.id, presentation=True,
+        )
+        MapContestToJudge.objects.create(
+            contestid=other_contest.id, judgeid=other_judge.id
+        )
+        sheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION,
+            isSubmitted=True,
+            **{f"field{number}": 10 for number in range(1, 9)},
+        )
+        MapScoresheetToTeamJudge.objects.create(
+            teamid=self.team.id,
+            judgeid=other_judge.id,
+            scoresheetid=sheet.id,
+            sheetType=ScoresheetEnum.PRESENTATION,
+        )
+
+        response = self.client.put(
+            reverse('tabulate_scores'),
+            {"contestid": self.contest.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.team.refresh_from_db()
+        self.assertEqual(self.team.presentation_score, 0)
+        self.assertEqual(self.team.total_score, 0)
 
     def test_preliminary_results(self):
         url = reverse('preliminary_results')
@@ -123,23 +157,15 @@ class TabulationAPITests(APITestCase):
 
     def test_championship_results(self):
         url = reverse('championship_results')
-        # Championship results uses PUT but gets contestid from GET params
-        # Note: The view has a bug - it uses contest_id instead of contestid in filter
-        # So this test might fail until that's fixed in the view
         url_with_params = f"{url}?contestid={self.contest.id}"
         response = self.client.put(url_with_params, {}, format='json')
-        # Note: Might return 200, 400, or 500 depending on setup and view bug
-        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR])
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
 
     def test_redesign_results(self):
         url = reverse('redesign_results')
-        # Redesign results uses PUT but gets contestid from GET params
-        # Note: The view has a bug - it uses contest_id instead of contestid in filter
-        # So this test might fail until that's fixed in the view
         url_with_params = f"{url}?contestid={self.contest.id}"
         response = self.client.put(url_with_params, {}, format='json')
-        # Note: Might return 200, 400, or 500 depending on setup and view bug
-        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR])
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
 
     def test_set_advancers(self):
         url = reverse('set_advancers')
@@ -149,8 +175,7 @@ class TabulationAPITests(APITestCase):
         }
         # Use PUT method (as per view decorator)
         response = self.client.put(url, data, format='json')
-        # Note: This might return 200 or 500 depending on implementation
-        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_500_INTERNAL_SERVER_ERROR])
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
 
     def test_list_advancers(self):
         # Set a team as advanced
@@ -644,14 +669,10 @@ class AdvanceAPITests(APITestCase):
             "contestid": self.contest.id,
             "championship_team_ids": [self.team.id]
         }
-        response = self.client.post(url, data)
-        # Note: This might return 200 or 400/500 depending on cluster setup
-        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR])
-        
-        if response.status_code == status.HTTP_200_OK:
-            self.team.refresh_from_db()
-            # Team should be marked as advanced
-            self.assertTrue(self.team.advanced_to_championship)
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.team.refresh_from_db()
+        self.assertTrue(self.team.advanced_to_championship)
 
     def test_undo_championship_advancement(self):
         # First advance a team
@@ -663,10 +684,6 @@ class AdvanceAPITests(APITestCase):
             "contestid": self.contest.id
         }
         response = self.client.post(url, data)
-        # Note: This might return 200 or 500 depending on implementation
-        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_500_INTERNAL_SERVER_ERROR])
-        
-        if response.status_code == status.HTTP_200_OK:
-            self.team.refresh_from_db()
-            # Team should no longer be advanced
-            self.assertFalse(self.team.advanced_to_championship)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.team.refresh_from_db()
+        self.assertFalse(self.team.advanced_to_championship)

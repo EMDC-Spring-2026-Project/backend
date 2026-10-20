@@ -249,7 +249,7 @@ class Scoresheet(models.Model):
                     errors[field] = error_message
             if errors:
                 raise ModelValidationError(errors)
-        elif self.sheetType == ScoresheetEnum.OTHERPENALTIES or ScoresheetEnum.REDESIGN:
+        elif self.sheetType in (ScoresheetEnum.OTHERPENALTIES, ScoresheetEnum.REDESIGN):
             required_fields = ['field1', 'field2', 'field3', 'field4', 'field5', 'field6', 'field7']
             for field in required_fields:
                 if getattr(self, field) is None:

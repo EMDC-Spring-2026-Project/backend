@@ -9,6 +9,7 @@ from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import ValidationError
 from django.shortcuts import get_object_or_404
+from django.http import Http404
 from django.db import transaction
 from ..models import JudgeClusters, MapContestToCluster, MapContestToOrganizer, MapUserToRole
 from ..serializers import JudgeClustersSerializer
@@ -98,7 +99,10 @@ def create_cluster(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def edit_cluster(request):
-    cluster = get_object_or_404(JudgeClusters, id=request.data["id"])
+    cluster_id = request.data.get("id")
+    if cluster_id is None:
+        return Response({"detail": "id is required."}, status=status.HTTP_400_BAD_REQUEST)
+    cluster = get_object_or_404(JudgeClusters, id=cluster_id)
     if not _can_manage_cluster(request.user, cluster.id):
         return Response({"detail": "You are not allowed to manage this cluster."}, status=status.HTTP_403_FORBIDDEN)
     
@@ -112,7 +116,7 @@ def edit_cluster(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
-    cluster.cluster_name = request.data["cluster_name"]
+    cluster.cluster_name = request.data.get("cluster_name", cluster.cluster_name)
     if "cluster_type" in request.data:
         cluster.cluster_type = request.data["cluster_type"]
     cluster.save()
@@ -146,6 +150,8 @@ def delete_cluster(request, cluster_id):
             cluster.delete()
             
             return Response({"detail": "Cluster and all associated mappings deleted successfully."}, status=status.HTTP_200_OK)
+    except Http404:
+        return Response({"detail": "Cluster not found."}, status=status.HTTP_404_NOT_FOUND)
     except Exception as e:
         return Response({"detail": f"Error deleting cluster: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 

@@ -9,6 +9,7 @@ from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import ValidationError
 from django.shortcuts import get_object_or_404
+from django.http import Http404
 from django.db import transaction
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -192,14 +193,16 @@ def edit_organizer(request):
                 pass
         
         # Update organizer details
-        organizer.first_name = request.data["first_name"]
-        organizer.last_name = request.data["last_name"]
+        organizer.first_name = request.data.get("first_name", organizer.first_name)
+        organizer.last_name = request.data.get("last_name", organizer.last_name)
         organizer.save()
         
         serializer = OrganizerSerializer(instance=organizer)
         return Response({"organizer": serializer.data}, status=status.HTTP_200_OK)
     
     except Organizer.DoesNotExist:
+        return Response({"error": "Organizer not found."}, status=status.HTTP_404_NOT_FOUND)
+    except Http404:
         return Response({"error": "Organizer not found."}, status=status.HTTP_404_NOT_FOUND)
     except Exception as e:
         return Response({"error": f"An error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -261,6 +264,8 @@ def delete_organizer(request, organizer_id):
 
     except Organizer.DoesNotExist:
         return Response({"error": "Organizer not found."}, status=status.HTTP_404_NOT_FOUND)
+    except Http404:
+        return Response({"error": "Organizer not found."}, status=status.HTTP_404_NOT_FOUND)
     except MapUserToRole.DoesNotExist:
         return Response({"error": "Organizer mapping not found."}, status=status.HTTP_404_NOT_FOUND)
     except Exception as e:
@@ -286,15 +291,33 @@ def organizer_disqualify_team(request):
     team = get_object_or_404(Teams, id=team_id)
     if not _can_manage_team(request.user, team.id):
         return Response({"detail": "You are not allowed to disqualify this team."}, status=status.HTTP_403_FORBIDDEN)
-    team.organizer_disqualified = request.data["organizer_disqualified"]
-    if team.judge_disqualified == True and team.organizer_disqualified == True:
-        team.cluster_rank = None
-        team.team_rank = None
-        scoresheetmappings = MapScoresheetToTeamJudge.objects.filter(teamid=team.id)
-        for mapping in scoresheetmappings:
-            scoresheet = Scoresheet.objects.get(id=mapping.scoresheetid)
-            scoresheet.isSubmitted = True
-            scoresheet.save()
-    team.save()
+    disqualified = request.data["organizer_disqualified"]
+    if isinstance(disqualified, str):
+        normalized = disqualified.strip().lower()
+        if normalized not in ("true", "false"):
+            return Response(
+                {"detail": "organizer_disqualified must be true or false."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        disqualified = normalized == "true"
+    if not isinstance(disqualified, bool):
+        return Response(
+            {"detail": "organizer_disqualified must be true or false."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    with transaction.atomic():
+        team.organizer_disqualified = disqualified
+        if team.judge_disqualified and team.organizer_disqualified:
+            team.cluster_rank = None
+            team.team_rank = None
+            scoresheet_ids = MapScoresheetToTeamJudge.objects.filter(
+                teamid=team.id
+            ).values_list("scoresheetid", flat=True)
+            # A stale mapping should not prevent the valid sheets and team from
+            # being finalized.
+            Scoresheet.objects.filter(id__in=scoresheet_ids).update(
+                isSubmitted=True
+            )
+        team.save()
     serializer = TeamSerializer(team)
     return Response({"team": serializer.data}, status=status.HTTP_200_OK)

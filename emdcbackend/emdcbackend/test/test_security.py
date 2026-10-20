@@ -232,11 +232,7 @@ class SecurityTests(APITestCase):
                 'contestid': self.contest.id
             }, format='json')
             # Should handle gracefully (may create team with sanitized name or reject)
-            self.assertIn(response.status_code, [
-                status.HTTP_201_CREATED,
-                status.HTTP_400_BAD_REQUEST,
-                status.HTTP_500_INTERNAL_SERVER_ERROR
-            ])
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
             # If created, verify it doesn't break database
             if response.status_code == status.HTTP_201_CREATED:
                 # Database should still be intact
@@ -270,12 +266,7 @@ class SecurityTests(APITestCase):
         }, format='json')
         
         # Should either reject or truncate, not crash
-        self.assertIn(response.status_code, [
-            status.HTTP_201_CREATED,
-            status.HTTP_400_BAD_REQUEST,
-            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            status.HTTP_500_INTERNAL_SERVER_ERROR  # May error on validation
-        ])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
     
     def test_negative_numbers_in_ids(self):
         """Test that negative IDs are handled safely"""
@@ -309,11 +300,7 @@ class SecurityTests(APITestCase):
                 'contestid': self.contest.id
             }, format='json')
             # Should handle gracefully (may error on some special chars)
-            self.assertIn(response.status_code, [
-                status.HTTP_201_CREATED,
-                status.HTTP_400_BAD_REQUEST,
-                status.HTTP_500_INTERNAL_SERVER_ERROR
-            ])
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
     
     def test_malformed_json_handling(self):
         """Test handling of malformed JSON"""
@@ -325,20 +312,14 @@ class SecurityTests(APITestCase):
             content_type='application/json'
         )
         # Should return 400 Bad Request
-        self.assertIn(response.status_code, [
-            status.HTTP_400_BAD_REQUEST,
-            status.HTTP_500_INTERNAL_SERVER_ERROR
-        ])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
     
     def test_missing_required_fields(self):
         """Test that missing required fields are handled"""
         url = reverse('create_team')
         response = self.client.post(url, {}, format='json')
         # May return 400 or 500 depending on validation timing
-        self.assertIn(response.status_code, [
-            status.HTTP_400_BAD_REQUEST,
-            status.HTTP_500_INTERNAL_SERVER_ERROR
-        ])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
     
     def test_wrong_data_types(self):
         """Test that wrong data types are rejected"""
@@ -349,11 +330,7 @@ class SecurityTests(APITestCase):
             'contestid': 'not_a_number'
         }, format='json')
         # Should return 400 Bad Request or 500 if validation happens later
-        self.assertIn(response.status_code, [
-            status.HTTP_400_BAD_REQUEST,
-            status.HTTP_500_INTERNAL_SERVER_ERROR,
-            status.HTTP_201_CREATED  # If it converts string to int
-        ])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
     
     # ========== Shared Password Security Tests ==========
     
