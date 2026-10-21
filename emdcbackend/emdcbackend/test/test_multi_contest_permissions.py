@@ -61,7 +61,21 @@ class MultiContestPermissionTests(APITestCase):
         response = self.client.delete(reverse("delete_team_by_id", args=[team.id]))
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("every contest it belongs to", response.data["detail"])
         self.assertTrue(Teams.objects.filter(id=team.id).exists())
+
+    def test_organizer_can_still_view_shared_team_in_contest_rankings(self):
+        team = self._link_team_to_both_contests()
+        team.team_rank = 1
+        team.save(update_fields=["team_rank"])
+
+        response = self.client.get(
+            reverse("get_teams_by_team_rank"),
+            {"contestid": self.managed_contest.id},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual([entry["id"] for entry in response.data["Teams"]], [team.id])
 
     def test_organizer_cannot_delete_judge_shared_with_unmanaged_contest(self):
         judge = Judge.objects.create(
@@ -104,6 +118,7 @@ class MultiContestPermissionTests(APITestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("every contest it belongs to", response.data["detail"])
         team.refresh_from_db()
         self.assertFalse(team.organizer_disqualified)
 

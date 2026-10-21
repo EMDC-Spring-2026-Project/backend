@@ -9,7 +9,8 @@ from django.contrib.auth.models import User
 from datetime import date, datetime
 from ..models import (
     Contest, Teams, Judge, Organizer, Admin, MapContestToOrganizer,
-    MapUserToRole, MapContestToTeam, Scoresheet, ScoresheetEnum
+    MapUserToRole, MapContestToTeam, MapContestToCluster, JudgeClusters,
+    Scoresheet, ScoresheetEnum
 )
 
 
@@ -30,56 +31,50 @@ class DataValidationTests(APITestCase):
             is_tabulated=False
         )
         MapContestToOrganizer.objects.create(contestid=self.contest.id, organizerid=self.organizer.id)
+        self.cluster = JudgeClusters.objects.create(
+            cluster_name="Validation Cluster", cluster_type="preliminary"
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.contest.id, clusterid=self.cluster.id
+        )
+
+    def _team_payload(self, team_name):
+        return {
+            'username': 'validation-coach@example.com',
+            'password': 'CoachPassword123!',
+            'first_name': 'Validation',
+            'last_name': 'Coach',
+            'team_name': team_name,
+            'contestid': self.contest.id,
+            'clusterid': self.cluster.id,
+        }
     
     # ========== Boundary Condition Tests ==========
     
     def test_team_name_max_length(self):
         """Test team name with maximum allowed length"""
         url = reverse('create_team')
-        # Create name at max length (assuming 255 chars)
-        max_name = 'A' * 255
-        response = self.client.post(url, {
-            'team_name': max_name,
-            'contestid': self.contest.id
-        }, format='json')
-        # Should either succeed or reject gracefully
-        self.assertIn(response.status_code, [
-            status.HTTP_201_CREATED,
-            status.HTTP_400_BAD_REQUEST,
-            status.HTTP_500_INTERNAL_SERVER_ERROR  # May error on validation
-        ])
+        max_name = 'A' * 99
+        response = self.client.post(url, self._team_payload(max_name), format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
     
     def test_team_name_min_length(self):
         """Test team name with minimum length"""
         url = reverse('create_team')
         min_name = 'A'  # Single character
-        response = self.client.post(url, {
-            'team_name': min_name,
-            'contestid': self.contest.id
-        }, format='json')
-        self.assertIn(response.status_code, [
-            status.HTTP_201_CREATED,
-            status.HTTP_400_BAD_REQUEST,
-            status.HTTP_500_INTERNAL_SERVER_ERROR  # May error if missing required fields
-        ])
+        response = self.client.post(url, self._team_payload(min_name), format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
     
     def test_team_name_empty_string(self):
         """Test team name with empty string"""
         url = reverse('create_team')
-        response = self.client.post(url, {
-            'team_name': '',
-            'contestid': self.contest.id
-        }, format='json')
-        # May return 400 or 500 depending on validation timing
-        self.assertIn(response.status_code, [status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR])
+        response = self.client.post(url, self._team_payload(''), format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
     
     def test_team_name_whitespace_only(self):
         """Test team name with only whitespace"""
         url = reverse('create_team')
-        response = self.client.post(url, {
-            'team_name': '   ',
-            'contestid': self.contest.id
-        }, format='json')
+        response = self.client.post(url, self._team_payload('   '), format='json')
         # Should reject or trim
         self.assertIn(response.status_code, [
             status.HTTP_400_BAD_REQUEST,
@@ -124,10 +119,7 @@ class DataValidationTests(APITestCase):
             'name': 'Test Contest',
             'date': 'invalid-date'
         }, format='json')
-        self.assertIn(response.status_code, [
-            status.HTTP_400_BAD_REQUEST,
-            status.HTTP_500_INTERNAL_SERVER_ERROR
-        ])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
         
         # Test future date (should be allowed)
         future_date = date(2100, 1, 1)
@@ -250,20 +242,13 @@ class DataValidationTests(APITestCase):
             'contestid': self.contest.id
         }, format='json')
         # May return 400 or 500 depending on validation
-        self.assertIn(response.status_code, [
-            status.HTTP_400_BAD_REQUEST,
-            status.HTTP_500_INTERNAL_SERVER_ERROR
-        ])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
         
         # Missing contestid
         response = self.client.post(url, {
             'team_name': 'Test Team'
         }, format='json')
-        self.assertIn(response.status_code, [
-            status.HTTP_400_BAD_REQUEST,
-            status.HTTP_201_CREATED,  # If contestid is optional
-            status.HTTP_500_INTERNAL_SERVER_ERROR
-        ])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
     
     # ========== Enum Validation Tests ==========
     
@@ -372,11 +357,7 @@ class DataValidationTests(APITestCase):
             'team_ids': team_ids
         }, format='json')
         # Should handle large list
-        self.assertIn(response.status_code, [
-            status.HTTP_200_OK,
-            status.HTTP_400_BAD_REQUEST,
-            status.HTTP_500_INTERNAL_SERVER_ERROR
-        ])
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
     
     def test_invalid_list_items(self):
         """Test handling of invalid items in lists"""
@@ -386,8 +367,4 @@ class DataValidationTests(APITestCase):
             'team_ids': ['not_an_integer', 123, -1]
         }, format='json')
         # Should reject invalid items (may return 200 if it filters them out)
-        self.assertIn(response.status_code, [
-            status.HTTP_400_BAD_REQUEST,
-            status.HTTP_500_INTERNAL_SERVER_ERROR,
-            status.HTTP_200_OK  # If it handles gracefully
-        ])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)

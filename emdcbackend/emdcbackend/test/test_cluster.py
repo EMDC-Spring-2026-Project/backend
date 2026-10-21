@@ -67,12 +67,31 @@ class ClusterAPITests(APITestCase):
         cluster.refresh_from_db()
         self.assertEqual(cluster.cluster_name, "Updated Cluster")
 
+    def test_edit_cluster_accepts_partial_request(self):
+        cluster = JudgeClusters.objects.create(
+            cluster_name="Original Cluster", cluster_type="preliminary"
+        )
+
+        response = self.client.post(
+            reverse('edit_cluster'), {"id": cluster.id}, format='json'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        cluster.refresh_from_db()
+        self.assertEqual(cluster.cluster_name, "Original Cluster")
+        self.assertEqual(cluster.cluster_type, "preliminary")
+
     def test_delete_cluster(self):
         cluster = JudgeClusters.objects.create(cluster_name="To Delete")
         url = reverse('delete_cluster', args=[cluster.id])
         response = self.client.delete(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertFalse(JudgeClusters.objects.filter(id=cluster.id).exists())
+
+    def test_delete_missing_cluster_returns_not_found(self):
+        response = self.client.delete(reverse('delete_cluster', args=[999999]))
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_unassigned_user_cannot_delete_cluster(self):
         contest = Contest.objects.create(

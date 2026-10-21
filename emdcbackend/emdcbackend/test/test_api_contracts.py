@@ -51,8 +51,7 @@ class APIContractTests(APITestCase):
         url = reverse('create_team')
         response = self.client.post(url, {}, format='json')  # Missing required fields
         
-        # May return 400 or 500 depending on validation timing
-        self.assertIn(response.status_code, [status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
         # Should have error details
         self.assertIsInstance(response.data, dict)
     
@@ -157,6 +156,7 @@ class APIContractTests(APITestCase):
             total_score=255.0,
             championship_score=0.0
         )
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=team.id)
         
         # Existing resource
         url = reverse('team_by_id', kwargs={'team_id': team.id})
@@ -194,23 +194,14 @@ class APIContractTests(APITestCase):
             'id': team.id,
             'team_name': 'Updated Team'
         }, format='json')
-        # May return 200, 201, or 500 if there's an error (e.g., missing required fields)
-        self.assertIn(response.status_code, [
-            status.HTTP_200_OK,
-            status.HTTP_201_CREATED,
-            status.HTTP_500_INTERNAL_SERVER_ERROR  # If validation fails or missing data
-        ])
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         
         # Invalid data
         response = self.client.post(url, {
             'id': team.id,
             'team_name': ''  # Invalid
         }, format='json')
-        self.assertIn(response.status_code, [
-            status.HTTP_400_BAD_REQUEST,
-            status.HTTP_200_OK,  # If validation is lenient
-            status.HTTP_500_INTERNAL_SERVER_ERROR  # May error on validation
-        ])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
     
     def test_delete_endpoint_status_codes(self):
         """Test that delete endpoints return correct status codes"""
@@ -245,8 +236,7 @@ class APIContractTests(APITestCase):
         url = reverse('create_team')
         response = self.client.post(url, {}, format='json')
         
-        # May return 400 or 500
-        self.assertIn(response.status_code, [status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
         # Error should indicate what's missing (if 400)
         if response.status_code == status.HTTP_400_BAD_REQUEST:
             error_str = str(response.data).lower()
@@ -318,6 +308,7 @@ class APIContractTests(APITestCase):
             total_score=255.0,
             championship_score=0.0
         )
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=team.id)
         
         url = reverse('team_by_id', kwargs={'team_id': team.id})
         response = self.client.get(url)

@@ -9,6 +9,7 @@ from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import ValidationError
 from django.shortcuts import get_object_or_404
+from django.http import Http404
 from django.db import transaction
 from ..serializers import AdminSerializer
 from ..models import Admin
@@ -129,9 +130,12 @@ def make_admin(data):
 def edit_admin(request):
     if not _is_admin(request.user):
         return Response({"detail": "Administrator access required."}, status=status.HTTP_403_FORBIDDEN)
-    admin = get_object_or_404(Admin, id=request.data["id"])
-    admin.first_name = request.data["first_name"]
-    admin.last_name = request.data["last_name"]
+    admin_id = request.data.get("id")
+    if admin_id is None:
+        return Response({"detail": "id is required."}, status=status.HTTP_400_BAD_REQUEST)
+    admin = get_object_or_404(Admin, id=admin_id)
+    admin.first_name = request.data.get("first_name", admin.first_name)
+    admin.last_name = request.data.get("last_name", admin.last_name)
     admin.save()
 
     serializer = AdminSerializer(instance=admin)
@@ -154,6 +158,8 @@ def delete_admin(request, admin_id):
         delete_user(user_id)
         return Response({"Detail": "Admin deleted successfully."}, status=status.HTTP_200_OK)
     except Admin.DoesNotExist:
+        return Response({"error": "Admin not found."}, status=status.HTTP_404_NOT_FOUND)
+    except Http404:
         return Response({"error": "Admin not found."}, status=status.HTTP_404_NOT_FOUND)
     except MapUserToRole.DoesNotExist:
         return Response({"error": "Admin mapping not found."}, status=status.HTTP_404_NOT_FOUND)

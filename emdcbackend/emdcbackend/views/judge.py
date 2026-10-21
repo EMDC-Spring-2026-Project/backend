@@ -18,7 +18,8 @@ from .scoresheets import create_sheets_for_teams_in_cluster, delete_sheets_for_t
 from ..auth.views import create_user
 from ..models import (
     Judge, Scoresheet, MapScoresheetToTeamJudge, MapJudgeToCluster,
-    Teams, MapContestToJudge, MapContestToOrganizer, MapUserToRole, JudgeClusters
+    Teams, MapContestToJudge, MapContestToOrganizer, MapUserToRole, JudgeClusters,
+    MapContestToCluster, MapContestToTeam, MapClusterToTeam,
 )
 from ..serializers import JudgeSerializer
 from ..auth.serializers import UserSerializer
@@ -75,7 +76,24 @@ def _can_manage_judge(user, judge_id):
     )
 
 
+def _validate_cluster_for_contest(user, contest_id, cluster_id):
+    if not _can_manage_contest(user, contest_id):
+        return Response(
+            {"detail": "You are not allowed to manage judges for this contest."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if not JudgeClusters.objects.filter(id=cluster_id).exists():
+        raise ValidationError({"clusterid": "Cluster not found."})
+    if not MapContestToCluster.objects.filter(
+        contestid=contest_id, clusterid=cluster_id
+    ).exists():
+        raise ValidationError({"clusterid": "Cluster does not belong to this contest."})
+    return None
+
+
 @api_view(["GET"])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
 def judge_by_id(request, judge_id):
     judge = get_object_or_404(Judge, id=judge_id)
     serializer = JudgeSerializer(instance=judge)
@@ -94,6 +112,31 @@ def create_judge(request):
         if not _can_manage_contest(request.user, contest_id):
             return Response({"detail": "You are not allowed to manage judges for this contest."}, status=status.HTTP_403_FORBIDDEN)
 
+        cluster_entries = request.data.get("clusterids")
+        if cluster_entries and isinstance(cluster_entries, list):
+            cluster_payloads = cluster_entries
+        else:
+            cluster_payloads = [{
+                "clusterid": request.data.get("clusterid"),
+                "presentation": request.data.get("presentation", False),
+                "journal": request.data.get("journal", False),
+                "mdo": request.data.get("mdo", False),
+                "runpenalties": request.data.get("runpenalties", False),
+                "otherpenalties": request.data.get("otherpenalties", False),
+                "redesign": request.data.get("redesign", False),
+                "championship": request.data.get("championship", False),
+            }]
+
+        for payload in cluster_payloads:
+            cluster_id = payload.get("clusterid")
+            if not cluster_id:
+                continue
+            cluster_error = _validate_cluster_for_contest(
+                request.user, contest_id, cluster_id
+            )
+            if cluster_error:
+                return cluster_error
+
         with transaction.atomic():
             user_response, judge_response = create_user_and_judge(request.data)
 
@@ -111,24 +154,7 @@ def create_judge(request):
                 "judgeid": judge_response.get("id")
             })
             if isinstance(contest_mapping, Response):
-                return contest_mapping
-
-            # Support both single clusterid and multiple clusterids
-            cluster_entries = request.data.get("clusterids")
-            if cluster_entries and isinstance(cluster_entries, list):
-                cluster_payloads = cluster_entries
-            else:
-                # Backward compatibility: single clusterid
-                cluster_payloads = [{
-                    "clusterid": request.data.get("clusterid"),
-                    "presentation": request.data.get("presentation", False),
-                    "journal": request.data.get("journal", False),
-                    "mdo": request.data.get("mdo", False),
-                    "runpenalties": request.data.get("runpenalties", False),
-                    "otherpenalties": request.data.get("otherpenalties", False),
-                    "redesign": request.data.get("redesign", False),
-                    "championship": request.data.get("championship", False),
-                }]
+                raise ValidationError(contest_mapping.data)
 
             # Process each cluster
             cluster_mappings = []
@@ -152,7 +178,7 @@ def create_judge(request):
                 })
 
                 if isinstance(cluster_mapping, Response):
-                    return cluster_mapping
+                    raise ValidationError(cluster_mapping.data)
 
                 cluster_mappings.append(cluster_mapping)
 
@@ -169,7 +195,7 @@ def create_judge(request):
                 )
 
                 if isinstance(score_sheets, Response):
-                    return score_sheets
+                    raise ValidationError(score_sheets.data)
 
                 score_sheets_list.append(score_sheets)
 
@@ -212,14 +238,18 @@ def _get_delete_flags_for_cluster_type(cluster_id):
 @permission_classes([IsAuthenticated])
 def edit_judge(request):
     try:
-        judge = get_object_or_404(Judge, id=request.data["id"])
+        judge_id = request.data.get("id")
+        if judge_id is None:
+            return Response({"detail": "id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        judge = get_object_or_404(Judge, id=judge_id)
         if not _can_manage_judge(request.user, judge.id):
             return Response({"detail": "You are not allowed to manage this judge."}, status=status.HTTP_403_FORBIDDEN)
 
+        cluster_update_requested = "clusters" in request.data or "clusterid" in request.data
         cluster_entries = request.data.get("clusters")
-        if cluster_entries and isinstance(cluster_entries, list):
+        if isinstance(cluster_entries, list):
             cluster_payloads = cluster_entries
-        else:
+        elif "clusterid" in request.data:
             cluster_payloads = [{
                 "clusterid": request.data.get("clusterid"),
                 "contestid": request.data.get("contestid"),
@@ -231,12 +261,19 @@ def edit_judge(request):
                 "redesign": request.data.get("redesign", False),
                 "championship": request.data.get("championship", False),
             }]
+        else:
+            cluster_payloads = []
 
-        new_first_name = request.data["first_name"]
-        new_last_name = request.data["last_name"]
-        new_phone_number = request.data["phone_number"]
-        new_username = request.data["username"]
-        new_role = request.data["role"]
+        for payload in cluster_payloads:
+            cluster_id = payload.get("clusterid")
+            if not cluster_id:
+                continue
+            contest_id = payload.get("contestid") or judge.contestid
+            cluster_error = _validate_cluster_for_contest(
+                request.user, contest_id, cluster_id
+            )
+            if cluster_error:
+                return cluster_error
 
         updated_cluster_ids = []
 
@@ -249,7 +286,8 @@ def edit_judge(request):
             except MapUserToRole.DoesNotExist:
                 # Try to find the existing user by username to create the missing mapping
                 # Note: We're NOT creating a new user, just finding the existing one
-                user = User.objects.filter(username=new_username).first()
+                new_username = request.data.get("username")
+                user = User.objects.filter(username=new_username).first() if new_username else None
                 if not user:
                     # If user doesn't exist, we can't create the mapping
                     raise ValidationError({
@@ -271,6 +309,12 @@ def edit_judge(request):
                     raise ValidationError({
                         "detail": f"Failed to create missing user role mapping for judge {judge.id}: {str(e)}"
                     })
+
+            new_first_name = request.data.get("first_name", judge.first_name)
+            new_last_name = request.data.get("last_name", judge.last_name)
+            new_phone_number = request.data.get("phone_number", judge.phone_number)
+            new_username = request.data.get("username", user.username)
+            new_role = request.data.get("role", judge.role)
 
             username_changed = (user.username != new_username)
             role_changed = (new_role != judge.role)
@@ -300,8 +344,10 @@ def edit_judge(request):
                     payload_cluster_ids.add(cluster_id)
 
             existing_assignments = MapJudgeToCluster.objects.filter(judgeid=judge.id)
+            if not cluster_update_requested:
+                updated_cluster_ids = list(existing_assignments.values_list("clusterid", flat=True))
             for assignment in existing_assignments:
-                if assignment.clusterid not in payload_cluster_ids:
+                if cluster_update_requested and assignment.clusterid not in payload_cluster_ids:
                     # Don't delete championship or redesign cluster assignments during editing
                     # These should be preserved unless explicitly being changed
                     if not (assignment.championship or assignment.redesign):
@@ -335,7 +381,7 @@ def edit_judge(request):
                     *delete_flags
                 )
 
-                map_cluster_to_judge({
+                cluster_mapping = map_cluster_to_judge({
                     "judgeid": judge.id,
                     "clusterid": cluster_id,
                     "contestid": contest_id,
@@ -347,8 +393,10 @@ def edit_judge(request):
                     "redesign": redesign,
                     "championship": championship,
                 })
+                if isinstance(cluster_mapping, Response):
+                    raise ValidationError(cluster_mapping.data)
 
-                create_sheets_for_teams_in_cluster(
+                score_sheets = create_sheets_for_teams_in_cluster(
                     judge.id,
                     cluster_id,
                     presentation,
@@ -359,9 +407,13 @@ def edit_judge(request):
                     redesign,
                     championship,
                 )
+                if isinstance(score_sheets, Response):
+                    raise ValidationError(score_sheets.data)
 
                 if contest_id and not MapContestToJudge.objects.filter(judgeid=judge.id, contestid=contest_id).exists():
-                    create_contest_to_judge_map({"contestid": contest_id, "judgeid": judge.id})
+                    contest_mapping = create_contest_to_judge_map({"contestid": contest_id, "judgeid": judge.id})
+                    if isinstance(contest_mapping, Response):
+                        raise ValidationError(contest_mapping.data)
 
                 updated_cluster_ids.append(cluster_id)
 
@@ -382,50 +434,40 @@ def edit_judge(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def delete_judge(request, judge_id):
+    judge = Judge.objects.filter(id=judge_id).first()
+    if not judge:
+        return Response({"detail": "Judge not found."}, status=status.HTTP_404_NOT_FOUND)
+    if not _can_manage_judge(request.user, judge.id):
+        return Response({"detail": "You are not allowed to manage this judge."}, status=status.HTTP_403_FORBIDDEN)
+
     try:
-        judge = get_object_or_404(Judge, id=judge_id)
-        if not _can_manage_judge(request.user, judge.id):
-            return Response({"detail": "You are not allowed to manage this judge."}, status=status.HTTP_403_FORBIDDEN)
-        scoresheet_mappings = MapScoresheetToTeamJudge.objects.filter(judgeid=judge_id)
-        scoresheet_ids = scoresheet_mappings.values_list('scoresheetid', flat=True)
-        scoresheets = Scoresheet.objects.filter(id__in=scoresheet_ids)
-        user_mapping_qs = MapUserToRole.objects.filter(role=3, relatedid=judge_id)
-        user = None
-        if user_mapping_qs.exists():
-            # In rare cases there might be multiple stale rows; use the first safely
-            user = User.objects.filter(id=user_mapping_qs.first().uuid).first()
-        # There can be zero, one, or many cluster mappings; handle all robustly
-        cluster_mappings_qs = MapJudgeToCluster.objects.filter(judgeid=judge_id)
-        teams_mappings = MapScoresheetToTeamJudge.objects.filter(judgeid=judge_id)
-        contest_mapping = MapContestToJudge.objects.filter(judgeid=judge_id)
+        with transaction.atomic():
+            scoresheet_mappings = MapScoresheetToTeamJudge.objects.filter(judgeid=judge_id)
+            scoresheet_ids = list(
+                scoresheet_mappings.values_list('scoresheetid', flat=True)
+            )
+            user_mapping_qs = MapUserToRole.objects.filter(role=3, relatedid=judge_id)
+            user = None
+            if user_mapping_qs.exists():
+                user = User.objects.filter(id=user_mapping_qs.first().uuid).first()
 
-        # Invalidate all active sessions for this user before deleting user
-        if user:
-            _delete_user_sessions(user.id)
-
-        # delete associated user
-        if user:
-            user.delete()
-        if user_mapping_qs.exists():
+            scoresheet_mappings.delete()
+            Scoresheet.objects.filter(id__in=scoresheet_ids).delete()
+            MapContestToJudge.objects.filter(judgeid=judge_id).delete()
+            MapJudgeToCluster.objects.filter(judgeid=judge_id).delete()
             user_mapping_qs.delete()
 
-        # delete associated scoresheets
-        for scoresheet in scoresheets:
-            scoresheet.delete()
+            user_id = user.id if user else None
+            if user:
+                user.delete()
+            judge.delete()
 
-        # delete associated judge-teams mappings
-        for mapping in teams_mappings:
-            mapping.delete()
-
-        # delete associated judge-contest mapping
-        contest_mapping.delete()
-
-        # delete associated judge-cluster mapping(s)
-        if cluster_mappings_qs.exists():
-            cluster_mappings_qs.delete()
-
-        # delete the judge
-        judge.delete()
+            if user_id:
+                transaction.on_commit(
+                    lambda deleted_user_id=user_id: _delete_user_sessions(
+                        deleted_user_id
+                    )
+                )
 
         return Response({"detail": "Judge deleted successfully."}, status=status.HTTP_200_OK)
 
@@ -475,15 +517,15 @@ def create_user_and_judge(data):
         "last_name": data["last_name"],
         "phone_number": data["phone_number"],
         "contestid": data["contestid"],
-        "presentation": data["presentation"],
-        "mdo": data["mdo"],
-        "journal": data["journal"],
-        "runpenalties": data["runpenalties"],
-        "otherpenalties": data["otherpenalties"],
+        "presentation": data.get("presentation", False),
+        "mdo": data.get("mdo", False),
+        "journal": data.get("journal", False),
+        "runpenalties": data.get("runpenalties", False),
+        "otherpenalties": data.get("otherpenalties", False),
         # new optional flags
         "redesign": data.get("redesign", False),
         "championship": data.get("championship", False),
-        "role": data["role"]
+        "role": data.get("role", Judge.JudgeRoleEnum.GENERAL)
     }
     judge_response = create_judge_instance(judge_data)
     if not judge_response.get('id'):
@@ -502,8 +544,20 @@ def are_all_score_sheets_submitted(request):
     """
     judges = request.data
 
-    if not judges:
-        return Response({"detail": "No judges provided."}, status=status.HTTP_400_BAD_REQUEST)
+    if not isinstance(judges, list) or not judges:
+        return Response(
+            {"detail": "A non-empty list of judges is required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    judge_ids = []
+    for judge in judges:
+        if not isinstance(judge, dict) or not isinstance(judge.get("id"), int):
+            return Response(
+                {"detail": "Each judge must include an integer id."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        judge_ids.append(judge["id"])
 
     results = {}
 
@@ -511,11 +565,38 @@ def are_all_score_sheets_submitted(request):
     cluster_id = request.query_params.get('cluster_id')
     team_ids = None
     if cluster_id:
-        from ..models import MapClusterToTeam
-        team_ids = list(MapClusterToTeam.objects.filter(clusterid=cluster_id).values_list('teamid', flat=True))
+        try:
+            cluster_id = int(cluster_id)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "cluster_id must be an integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        contest_ids = list(MapContestToCluster.objects.filter(
+            clusterid=cluster_id
+        ).values_list("contestid", flat=True))
+        can_view_cluster = bool(contest_ids) and all(
+            _can_manage_contest(request.user, contest_id)
+            for contest_id in contest_ids
+        )
+        judges_belong_to_cluster = MapJudgeToCluster.objects.filter(
+            judgeid__in=judge_ids, clusterid=cluster_id
+        ).values("judgeid").distinct().count() == len(set(judge_ids))
+        if not can_view_cluster or not judges_belong_to_cluster:
+            return Response(
+                {"detail": "You are not allowed to view one or more judges."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        team_ids = list(MapClusterToTeam.objects.filter(
+            clusterid=cluster_id
+        ).values_list('teamid', flat=True))
+    elif any(not _can_manage_judge(request.user, judge_id) for judge_id in judge_ids):
+        return Response(
+            {"detail": "You are not allowed to view one or more judges."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
-    for judge in judges:
-        judge_id = judge.get('id')
+    for judge_id in judge_ids:
 
         if team_ids is not None:
             mappings = MapScoresheetToTeamJudge.objects.filter(judgeid=judge_id, teamid__in=team_ids)
@@ -554,13 +635,48 @@ def judge_disqualify_team(request):
     judge_ids = MapUserToRole.objects.filter(
         uuid=request.user.id, role=MapUserToRole.RoleEnum.JUDGE
     ).values_list("relatedid", flat=True)
-    is_assigned_judge = MapScoresheetToTeamJudge.objects.filter(
+    has_team_assignment = MapScoresheetToTeamJudge.objects.filter(
         teamid=team.id, judgeid__in=judge_ids
     ).exists()
+    team_contest_ids = set(MapContestToTeam.objects.filter(
+        teamid=team.id
+    ).values_list("contestid", flat=True))
+    judge_contest_ids = set(MapContestToJudge.objects.filter(
+        judgeid__in=judge_ids
+    ).values_list("contestid", flat=True))
+    is_assigned_judge = (
+        has_team_assignment
+        and bool(team_contest_ids)
+        and team_contest_ids.issubset(judge_contest_ids)
+    )
     if not is_admin and not is_assigned_judge:
         return Response({"detail": "You are not allowed to disqualify this team."}, status=status.HTTP_403_FORBIDDEN)
-    team.judge_disqualified = request.data["judge_disqualified"]
-    team.save()
+    disqualified = request.data["judge_disqualified"]
+    if isinstance(disqualified, str):
+        normalized = disqualified.strip().lower()
+        if normalized not in ("true", "false"):
+            return Response(
+                {"detail": "judge_disqualified must be true or false."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        disqualified = normalized == "true"
+    if not isinstance(disqualified, bool):
+        return Response(
+            {"detail": "judge_disqualified must be true or false."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    with transaction.atomic():
+        team.judge_disqualified = disqualified
+        if team.judge_disqualified and team.organizer_disqualified:
+            team.cluster_rank = None
+            team.team_rank = None
+            scoresheet_ids = MapScoresheetToTeamJudge.objects.filter(
+                teamid=team.id
+            ).values_list("scoresheetid", flat=True)
+            Scoresheet.objects.filter(id__in=scoresheet_ids).update(
+                isSubmitted=True
+            )
+        team.save()
     return Response(status=status.HTTP_200_OK)
 
 
@@ -569,39 +685,22 @@ def sync_judge_sheet_flags(judge_id):
     Sync the judge's global sheet flags based on all their cluster assignments.
     A sheet flag should be True if the judge has that sheet type enabled in ANY of their cluster assignments.
     """
-    try:
-        judge = Judge.objects.get(id=judge_id)
+    judge = Judge.objects.get(id=judge_id)
 
-        # Get all cluster assignments for this judge
-        assignments = MapJudgeToCluster.objects.filter(judgeid=judge_id)
-
-        # Aggregate all sheet types across all assignments
-        has_presentation = assignments.filter(presentation=True).exists()
-        has_journal = assignments.filter(journal=True).exists()
-        has_mdo = assignments.filter(mdo=True).exists()
-        has_runpenalties = assignments.filter(runpenalties=True).exists()
-        has_otherpenalties = assignments.filter(otherpenalties=True).exists()
-        has_redesign = assignments.filter(redesign=True).exists()
-        has_championship = assignments.filter(championship=True).exists()
-
-        # Update judge flags
-        judge.presentation = has_presentation
-        judge.journal = has_journal
-        judge.mdo = has_mdo
-        judge.runpenalties = has_runpenalties
-        judge.otherpenalties = has_otherpenalties
-        judge.redesign = has_redesign
-        judge.championship = has_championship
-        judge.save()
-
-    except Judge.DoesNotExist:
-        pass  # Judge doesn't exist, nothing to sync
-    except Exception as e:
-        # Log error but don't fail the operation
-        print(f"Error syncing judge sheet flags for judge {judge_id}: {str(e)}")
+    assignments = MapJudgeToCluster.objects.filter(judgeid=judge_id)
+    judge.presentation = assignments.filter(presentation=True).exists()
+    judge.journal = assignments.filter(journal=True).exists()
+    judge.mdo = assignments.filter(mdo=True).exists()
+    judge.runpenalties = assignments.filter(runpenalties=True).exists()
+    judge.otherpenalties = assignments.filter(otherpenalties=True).exists()
+    judge.redesign = assignments.filter(redesign=True).exists()
+    judge.championship = assignments.filter(championship=True).exists()
+    judge.save()
 
 
 @api_view(["GET"])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
 def get_all_judges(request):
     """Get all judges"""
     try:

@@ -18,6 +18,7 @@ from ..models import (
     MapContestToOrganizer,
     MapUserToRole,
     MapJudgeToCluster,
+    MapContestToJudge,
     Judge,
 )
 
@@ -61,16 +62,21 @@ def _compute_totals_for_team(team: Teams, contest_id: int = None):
         ).values_list("clusterid", flat=True)
 
         # Judges still mapped into those clusters
-        active_judge_ids = MapJudgeToCluster.objects.filter(
+        cluster_judge_ids = set(MapJudgeToCluster.objects.filter(
             clusterid__in=contest_cluster_ids
-        ).values_list("judgeid", flat=True).distinct()
+        ).values_list("judgeid", flat=True))
+        contest_judge_ids = set(MapContestToJudge.objects.filter(
+            contestid=contest_id
+        ).values_list("judgeid", flat=True))
+        active_judge_ids = cluster_judge_ids | contest_judge_ids
 
         if active_judge_ids:
             # Use only scores from active judges
             score_map = base_qs.filter(judgeid__in=active_judge_ids)
         else:
-            # No active judge info → fall back to all scoresheets for this team
-            score_map = base_qs
+            # With an explicit contest context, unassigned sheets may belong to
+            # another contest that shares this team and must not be counted.
+            score_map = base_qs.none()
     else:
         # No contest context → use all scoresheets for this team
         score_map = base_qs
@@ -465,6 +471,11 @@ def set_advancers(request):
         return Response({"ok": False, "message": "contestid is required"}, status=400)
     if not isinstance(team_ids, list):
         return Response({"ok": False, "message": "team_ids must be a list of ints"}, status=400)
+    if any(not isinstance(team_id, int) or isinstance(team_id, bool) or team_id <= 0 for team_id in team_ids):
+        return Response(
+            {"ok": False, "message": "team_ids must contain only positive integers"},
+            status=400,
+        )
 
     if not _ensure_requester_is_organizer_of_contest(request.user, contest_id):
         return Response({"ok": False, "message": "Organizer of this contest required."}, status=403)

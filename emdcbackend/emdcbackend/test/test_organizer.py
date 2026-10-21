@@ -1,7 +1,10 @@
 from rest_framework import status
 from rest_framework.test import APITestCase
 from django.urls import reverse
-from ..models import Admin, Organizer, MapUserToRole, Contest, Teams, MapContestToOrganizer, MapContestToTeam
+from ..models import (
+    Admin, Organizer, MapUserToRole, Contest, Teams, MapContestToOrganizer,
+    MapContestToTeam, MapScoresheetToTeamJudge, Scoresheet, ScoresheetEnum,
+)
 from django.contrib.auth import get_user_model
 from ..serializers import OrganizerSerializer  # Assuming you have a serializer for Organizer
 
@@ -66,6 +69,19 @@ class OrganizerAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['organizer']['first_name'], "Updated")
 
+    def test_edit_organizer_accepts_partial_request(self):
+        response = self.client.post(
+            reverse('edit_organizer'),
+            {"id": self.organizer.id, "username": "partial@example.com"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.organizer.refresh_from_db()
+        self.user.refresh_from_db()
+        self.assertEqual(self.organizer.first_name, "Test")
+        self.assertEqual(self.organizer.last_name, "User")
+        self.assertEqual(self.user.username, "partial@example.com")
+
     def test_delete_organizer(self):
         self.authenticate_admin()
         url = reverse('delete_organizer', args=[self.organizer.id])
@@ -73,6 +89,13 @@ class OrganizerAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["Detail"], "Organizer and all related mappings deleted successfully.")
         self.assertFalse(Organizer.objects.filter(id=self.organizer.id).exists())
+
+    def test_delete_missing_organizer_returns_not_found(self):
+        self.authenticate_admin()
+
+        response = self.client.delete(reverse('delete_organizer', args=[999999]))
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_non_admin_cannot_create_or_delete_organizers(self):
         create_response = self.client.post(
@@ -156,6 +179,47 @@ class OrganizerAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         team.refresh_from_db()
         self.assertTrue(team.organizer_disqualified)
+
+    def test_full_disqualification_handles_stale_scoresheet_mapping(self):
+        team = Teams.objects.create(
+            team_name="Stale Mapping Team",
+            judge_disqualified=True,
+            team_rank=2,
+            cluster_rank=1,
+        )
+        contest = Contest.objects.create(
+            name="Stale Mapping Contest", date="2026-01-01",
+            is_open=True, is_tabulated=False,
+        )
+        MapContestToOrganizer.objects.create(
+            contestid=contest.id, organizerid=self.organizer.id
+        )
+        MapContestToTeam.objects.create(contestid=contest.id, teamid=team.id)
+        scoresheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=False
+        )
+        MapScoresheetToTeamJudge.objects.create(
+            teamid=team.id, judgeid=1, scoresheetid=scoresheet.id,
+            sheetType=ScoresheetEnum.PRESENTATION,
+        )
+        MapScoresheetToTeamJudge.objects.create(
+            teamid=team.id, judgeid=2, scoresheetid=999999,
+            sheetType=ScoresheetEnum.PRESENTATION,
+        )
+
+        response = self.client.post(
+            reverse('organizer_disqualify_team'),
+            {"teamid": team.id, "organizer_disqualified": True},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        team.refresh_from_db()
+        scoresheet.refresh_from_db()
+        self.assertTrue(team.organizer_disqualified)
+        self.assertIsNone(team.team_rank)
+        self.assertIsNone(team.cluster_rank)
+        self.assertTrue(scoresheet.isSubmitted)
 
     def test_unassigned_organizer_cannot_disqualify_team(self):
         team = Teams.objects.create(team_name="Protected Team")

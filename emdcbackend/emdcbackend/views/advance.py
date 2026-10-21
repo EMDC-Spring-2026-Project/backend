@@ -3,6 +3,7 @@ from rest_framework.decorators import api_view, authentication_classes, permissi
 from rest_framework.response import Response
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
+from django.db import transaction
 
 from ..models import (
     Teams,
@@ -22,6 +23,7 @@ from .tabulation import recompute_totals_and_ranks, _ensure_requester_is_organiz
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def advance_to_championship(request):
     contest_id = request.data.get("contestid")
     championship_team_ids = request.data.get("championship_team_ids", [])
@@ -40,16 +42,7 @@ def advance_to_championship(request):
             MapContestToTeam.objects.filter(contestid=contest_id).values_list("teamid", flat=True)
         )
         
-        Teams.objects.filter(id__in=contest_team_ids).update(
-            advanced_to_championship=False, 
-            championship_rank=None
-        )
-        
         valid_championship_teams = [tid for tid in championship_team_ids if tid in contest_team_ids]
-        
-        if valid_championship_teams:
-            Teams.objects.filter(id__in=valid_championship_teams).update(advanced_to_championship=True)
-        
         non_championship_teams = [tid for tid in contest_team_ids if tid not in valid_championship_teams]
         
         contest_clusters = MapContestToCluster.objects.filter(contestid=contest_id)
@@ -75,6 +68,15 @@ def advance_to_championship(request):
             return Response({"ok": False, "message": "Championship cluster not found. Please create it first."}, status=400)
         if not redesign_cluster:
             return Response({"ok": False, "message": "Redesign cluster not found. Please create it first."}, status=400)
+
+        Teams.objects.filter(id__in=contest_team_ids).update(
+            advanced_to_championship=False,
+            championship_rank=None,
+        )
+        if valid_championship_teams:
+            Teams.objects.filter(id__in=valid_championship_teams).update(
+                advanced_to_championship=True
+            )
         
         championship_cluster.is_active = True
         championship_cluster.save()
@@ -212,12 +214,14 @@ def advance_to_championship(request):
         }, status=200)
         
     except Exception as e:
+        transaction.set_rollback(True)
         return Response({"ok": False, "message": f"Error during championship advancement: {str(e)}"}, status=500)
 
 
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def undo_championship_advancement(request):
     """
     Undo championship advancement and revert to preliminary state:
@@ -425,6 +429,7 @@ def undo_championship_advancement(request):
         }, status=200)
         
     except Exception as e:
+        transaction.set_rollback(True)
         import traceback
         error_details = traceback.format_exc()
         return Response({"ok": False, "message": f"Error undoing championship advancement: {str(e)}"}, status=500)

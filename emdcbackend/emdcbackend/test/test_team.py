@@ -2,7 +2,12 @@ from django.urls import reverse
 from rest_framework.test import APITestCase
 from rest_framework import status
 from django.contrib.auth.models import User
-from ..models import Teams, Contest, Coach, MapUserToRole, Admin
+from unittest.mock import patch
+from ..models import (
+    Teams, Contest, Coach, MapUserToRole, Admin, JudgeClusters,
+    MapContestToCluster, MapContestToTeam, MapClusterToTeam, MapCoachToTeam,
+    Judge, MapContestToJudge,
+)
 from ..serializers import TeamSerializer
 
 
@@ -23,6 +28,12 @@ class TeamAPITests(APITestCase):
             date=date.today(),
             is_open=True,
             is_tabulated=False
+        )
+        self.cluster = JudgeClusters.objects.create(
+            cluster_name="Preliminary Cluster", cluster_type="preliminary"
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.contest.id, clusterid=self.cluster.id
         )
 
     def test_team_by_id(self):
@@ -68,6 +79,66 @@ class TeamAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data['teams']), 2)
 
+    def test_team_by_id_requires_sign_in(self):
+        team = Teams.objects.create(team_name="Private Team")
+        self.client.logout()
+
+        response = self.client.get(reverse('team_by_id', args=[team.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_unrelated_user_cannot_view_team(self):
+        team = Teams.objects.create(team_name="Unrelated Team")
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=team.id)
+        unrelated = User.objects.create_user(
+            username="unrelated-team@example.com", password="testpassword"
+        )
+        self.client.force_authenticate(user=unrelated)
+
+        response = self.client.get(reverse('team_by_id', args=[team.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_judge_team_list_is_limited_to_assigned_contests(self):
+        assigned_team = Teams.objects.create(team_name="Assigned Team")
+        MapContestToTeam.objects.create(
+            contestid=self.contest.id, teamid=assigned_team.id
+        )
+        other_contest = Contest.objects.create(
+            name="Other Contest", date=self.contest.date,
+            is_open=True, is_tabulated=False,
+        )
+        other_team = Teams.objects.create(team_name="Other Team")
+        MapContestToTeam.objects.create(
+            contestid=other_contest.id, teamid=other_team.id
+        )
+        judge = Judge.objects.create(
+            first_name="Team", last_name="Judge", contestid=self.contest.id,
+            phone_number="5551112222",
+        )
+        judge_user = User.objects.create_user(
+            username="team-judge@example.com", password="testpassword"
+        )
+        MapUserToRole.objects.create(
+            uuid=judge_user.id, role=MapUserToRole.RoleEnum.JUDGE,
+            relatedid=judge.id,
+        )
+        MapContestToJudge.objects.create(
+            contestid=self.contest.id, judgeid=judge.id
+        )
+        self.client.force_authenticate(user=judge_user)
+
+        detail_response = self.client.get(
+            reverse('team_by_id', args=[assigned_team.id])
+        )
+        list_response = self.client.get(reverse('get_all_teams'))
+
+        self.assertEqual(detail_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [team["id"] for team in list_response.data["teams"]],
+            [assigned_team.id],
+        )
+
     def test_create_team(self):
         url = reverse('create_team')
         data = {
@@ -77,11 +148,46 @@ class TeamAPITests(APITestCase):
             "last_name": "Name",
             "team_name": "New Team",
             "contestid": self.contest.id,
-            "clusterid": 1
+            "clusterid": self.cluster.id
         }
         response = self.client.post(url, data)
-        # Note: This might return 201 or 500 depending on implementation
-        self.assertIn(response.status_code, [status.HTTP_201_CREATED, status.HTTP_500_INTERNAL_SERVER_ERROR])
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    @patch("emdcbackend.views.coach.send_set_password_email")
+    @patch("emdcbackend.views.team.make_sheets_for_team", side_effect=RuntimeError("generation failed"))
+    def test_create_team_rolls_back_if_scoresheet_generation_fails(
+        self, _mock_make_sheets, mock_send_email
+    ):
+        initial_counts = {
+            "teams": Teams.objects.count(),
+            "coaches": Coach.objects.count(),
+            "users": User.objects.count(),
+        }
+
+        response = self.client.post(
+            reverse('create_team'),
+            {
+                "username": "rollback-coach@example.com",
+                "password": "coachpassword",
+                "first_name": "Rollback",
+                "last_name": "Coach",
+                "team_name": "Rollback Team",
+                "contestid": self.contest.id,
+                "clusterid": self.cluster.id,
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertIn("No team or coach changes were saved", response.data["detail"])
+        self.assertNotIn("generation failed", response.data["detail"])
+        self.assertEqual(Teams.objects.count(), initial_counts["teams"])
+        self.assertEqual(Coach.objects.count(), initial_counts["coaches"])
+        self.assertEqual(User.objects.count(), initial_counts["users"])
+        self.assertFalse(MapContestToTeam.objects.exists())
+        self.assertFalse(MapClusterToTeam.objects.exists())
+        self.assertFalse(MapCoachToTeam.objects.exists())
+        mock_send_email.assert_not_called()
 
     def test_unprivileged_user_cannot_change_team_roster(self):
         team = Teams.objects.create(team_name="Protected Team")
@@ -124,11 +230,36 @@ class TeamAPITests(APITestCase):
             "last_name": "Name",
             "team_name": "Updated Team",
             "contestid": self.contest.id,
-            "clusterid": 1
+            "clusterid": self.cluster.id
         }
         response = self.client.post(url, data)
-        # Note: This might return 200 or 500 depending on implementation
-        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_500_INTERNAL_SERVER_ERROR])
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        team.refresh_from_db()
+        self.assertEqual(team.team_name, "Updated Team")
+
+    def test_edit_team_accepts_partial_request(self):
+        team = Teams.objects.create(team_name="Original Team")
+        coach = Coach.objects.create(first_name="Original", last_name="Coach")
+        coach_user = User.objects.create_user(
+            username="partial-coach@example.com", password="password"
+        )
+        MapUserToRole.objects.create(uuid=coach_user.id, role=4, relatedid=coach.id)
+        from ..models import MapCoachToTeam, MapContestToTeam
+        MapCoachToTeam.objects.create(teamid=team.id, coachid=coach.id)
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=team.id)
+
+        response = self.client.post(
+            reverse('edit_team'),
+            {"id": team.id, "team_name": "Updated Team"},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        team.refresh_from_db()
+        coach.refresh_from_db()
+        self.assertEqual(team.team_name, "Updated Team")
+        self.assertEqual(coach.first_name, "Original")
+        self.assertEqual(coach.last_name, "Coach")
 
     def test_delete_team_by_id(self):
         team = Teams.objects.create(
@@ -145,8 +276,15 @@ class TeamAPITests(APITestCase):
         MapContestToTeam.objects.create(contestid=self.contest.id, teamid=team.id)
         url = reverse('delete_team_by_id', args=[team.id])
         response = self.client.delete(url)
-        # Note: This might return 200 or 500 depending on cleanup logic
-        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_500_INTERNAL_SERVER_ERROR])
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertFalse(Teams.objects.filter(id=team.id).exists())
+
+    def test_edit_missing_team_returns_not_found(self):
+        response = self.client.post(
+            reverse('edit_team'), {"id": 999999}, format='json'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_is_team_disqualified(self):
         team = Teams.objects.create(
@@ -160,18 +298,11 @@ class TeamAPITests(APITestCase):
             championship_score=0.0,
             organizer_disqualified=True
         )
-        # The view expects POST with teamid in body, but URL pattern shows GET
-        # Let's test with POST as the view function expects
         url = reverse('is_team_disqualified', args=[team.id])
-        # Try POST first (as view expects)
-        response = self.client.post(url, {"teamid": team.id}, format='json')
-        # If that doesn't work, the URL might be wrong - skip this test for now
-        if response.status_code not in [status.HTTP_200_OK, status.HTTP_405_METHOD_NOT_ALLOWED]:
-            # Skip test if endpoint has issues
-            self.skipTest("Endpoint configuration issue")
-        # If POST works, check response
-        if response.status_code == status.HTTP_200_OK:
-            self.assertTrue(response.data.get('is disqualified', False))
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data.get('is disqualified', False))
 
     def test_create_team_after_judge(self):
         """Test creating a team after judge assignment"""
@@ -183,11 +314,65 @@ class TeamAPITests(APITestCase):
             "last_name": "Name",
             "team_name": "New Team After Judge",
             "contestid": self.contest.id,
-            "clusterid": 1
+            "clusterid": self.cluster.id
         }
         response = self.client.post(url, data, format='json')
-        # Note: This might return 201, 400, or 500 depending on cluster/judge setup
-        self.assertIn(response.status_code, [status.HTTP_201_CREATED, status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR])
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_create_team_rejects_cluster_from_another_contest_atomically(self):
+        from datetime import date
+        other_contest = Contest.objects.create(
+            name="Other Contest", date=date.today(), is_open=True, is_tabulated=False
+        )
+        other_cluster = JudgeClusters.objects.create(
+            cluster_name="Other Cluster", cluster_type="preliminary"
+        )
+        MapContestToCluster.objects.create(
+            contestid=other_contest.id, clusterid=other_cluster.id
+        )
+        initial_team_count = Teams.objects.count()
+        initial_user_count = User.objects.count()
+
+        response = self.client.post(
+            reverse('create_team'),
+            {
+                "username": "wrong-cluster-coach@example.com",
+                "password": "coachpassword",
+                "first_name": "Coach",
+                "last_name": "Name",
+                "team_name": "Wrong Cluster Team",
+                "contestid": self.contest.id,
+                "clusterid": other_cluster.id,
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(Teams.objects.count(), initial_team_count)
+        self.assertEqual(User.objects.count(), initial_user_count)
+
+    def test_unprivileged_user_cannot_use_create_team_after_judge(self):
+        unprivileged_user = User.objects.create_user(
+            username="ordinary-team-creator@example.com", password="testpassword"
+        )
+        self.client.force_authenticate(user=unprivileged_user)
+
+        response = self.client.post(
+            reverse('create_team_after_judge'),
+            {
+                "username": "new-coach@example.com",
+                "password": "coachpassword",
+                "first_name": "New",
+                "last_name": "Coach",
+                "team_name": "Unauthorized Team",
+                "contestid": self.contest.id,
+                "clusterid": self.cluster.id,
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(Teams.objects.filter(team_name="Unauthorized Team").exists())
 
     def test_get_teams_by_team_rank(self):
         """Test getting teams by team rank"""
@@ -221,25 +406,12 @@ class TeamAPITests(APITestCase):
         MapContestToTeam.objects.create(contestid=self.contest.id, teamid=team2.id)
         
         url = reverse('get_teams_by_team_rank')
-        # GET request but expects data in body (implementation issue - GET doesn't have body)
-        # This endpoint has a bug: it uses GET but tries to access request.data
-        # The test will likely fail with KeyError, which is expected due to the implementation bug
-        try:
-            response = self.client.get(url, data={"contestid": self.contest.id}, format='json')
-            self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_405_METHOD_NOT_ALLOWED, status.HTTP_500_INTERNAL_SERVER_ERROR])
-            if response.status_code == status.HTTP_200_OK and response.data:
-                self.assertIn('Teams', response.data)
-        except KeyError:
-            # Expected due to implementation bug (GET request trying to access request.data)
-            self.skipTest("Endpoint has implementation issue: GET request accessing request.data")
+        response = self.client.get(url, data={"contestid": self.contest.id}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertIn('Teams', response.data)
 
     def test_get_teams_by_team_rank_missing_contestid(self):
         """Test get_teams_by_team_rank with missing contestid"""
         url = reverse('get_teams_by_team_rank')
-        # This endpoint has a bug: it uses GET but tries to access request.data
-        try:
-            response = self.client.get(url, {}, format='json')
-            self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST, status.HTTP_405_METHOD_NOT_ALLOWED, status.HTTP_500_INTERNAL_SERVER_ERROR])
-        except KeyError:
-            # Expected due to implementation bug
-            self.skipTest("Endpoint has implementation issue: GET request accessing request.data")
+        response = self.client.get(url, {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)

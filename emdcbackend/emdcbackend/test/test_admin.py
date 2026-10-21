@@ -4,6 +4,7 @@ from rest_framework import status
 from ..models import Admin, MapUserToRole
 from ..serializers import AdminSerializer
 from django.contrib.auth.models import User
+from unittest.mock import patch
 
 
 class AdminTests(APITestCase):
@@ -48,6 +49,30 @@ class AdminTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["admin"]["first_name"], "New")
 
+    @patch("emdcbackend.auth.views.send_set_password_email")
+    @patch(
+        "emdcbackend.views.admin.create_user_role_map",
+        side_effect=RuntimeError("role mapping failed"),
+    )
+    def test_failed_admin_creation_rolls_back_without_sending_email(
+        self, _create_role, mock_send_email
+    ):
+        response = self.client.post(
+            reverse("create_admin"),
+            {
+                "username": "rollback-admin@example.com",
+                "password": "NewPassword123!",
+                "first_name": "Rollback",
+                "last_name": "Admin",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertFalse(User.objects.filter(username="rollback-admin@example.com").exists())
+        self.assertFalse(Admin.objects.filter(first_name="Rollback").exists())
+        mock_send_email.assert_not_called()
+
     def test_edit_admin(self):
         url = reverse("edit_admin")
         data = {
@@ -59,18 +84,31 @@ class AdminTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["Admin"]["first_name"], "Updated")
 
+    def test_edit_admin_accepts_partial_request(self):
+        response = self.client.post(
+            reverse("edit_admin"),
+            {"id": self.admin.id, "first_name": "Updated"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.admin.refresh_from_db()
+        self.assertEqual(self.admin.first_name, "Updated")
+        self.assertEqual(self.admin.last_name, "User")
+
     def test_delete_admin(self):
         url = reverse("delete_admin", args=[self.admin.id])
         response = self.client.delete(url)
         # Note: This might fail if the mapping doesn't exist or has wrong field names
         # The actual response depends on the implementation
-        if response.status_code == status.HTTP_200_OK:
-            self.assertEqual(response.data["Detail"], "Admin deleted successfully.")
-            self.assertFalse(Admin.objects.filter(id=self.admin.id).exists())
-        else:
-            # If it fails, it's likely due to mapping issues in the view
-            # We'll just check that it doesn't crash
-            self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_500_INTERNAL_SERVER_ERROR])
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["Detail"], "Admin deleted successfully.")
+        self.assertFalse(Admin.objects.filter(id=self.admin.id).exists())
+
+    def test_delete_missing_admin_returns_not_found(self):
+        response = self.client.delete(reverse("delete_admin", args=[999999]))
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_non_admin_cannot_access_admin_management(self):
         ordinary_user = User.objects.create_user(

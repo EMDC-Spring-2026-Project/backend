@@ -135,3 +135,37 @@ class BallotVoteAPITests(APITestCase):
         self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_201_CREATED])
         self.assertTrue(MapAwardToContest.objects.filter(contestid=self.contest.id, awardid=self.award.id).exists())
 
+    def test_non_admin_cannot_access_ballot_or_vote_admin_endpoints(self):
+        ordinary_user = User.objects.create_user(
+            username="ordinary-ballot-user@example.com", password="testpassword"
+        )
+        self.client.force_authenticate(user=ordinary_user)
+        ballot = Ballot.objects.create(contestid=self.contest.id, isSubmitted=False)
+        vote = Votes.objects.create(votedteamid=self.team.id)
+
+        requests = [
+            self.client.post(reverse('create_ballot'), {
+                "contestid": self.contest.id, "isSubmitted": False
+            }),
+            self.client.get(reverse('get_all_ballots')),
+            self.client.delete(reverse('delete_ballot', args=[ballot.id])),
+            self.client.post(reverse('create_vote'), {"votedteamid": self.team.id}),
+            self.client.get(reverse('get_all_votes')),
+            self.client.post(reverse('create_map_ballot_to_vote'), {
+                "ballotid": ballot.id, "voteid": vote.id
+            }),
+            self.client.post(reverse('create_map_vote_to_award'), {
+                "voteid": vote.id, "awardid": self.award.id
+            }),
+            self.client.post(reverse('create_map_team_to_vote'), {
+                "teamid": self.team.id, "voteid": vote.id
+            }),
+            self.client.post(reverse('create_map_award_to_contest'), {
+                "contestid": self.contest.id, "awardid": self.award.id
+            }),
+        ]
+
+        for response in requests:
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(Ballot.objects.filter(id=ballot.id).exists())
+
