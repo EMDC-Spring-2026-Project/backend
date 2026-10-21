@@ -179,6 +179,8 @@ class TeamAPITests(APITestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertIn("No team or coach changes were saved", response.data["detail"])
+        self.assertNotIn("generation failed", response.data["detail"])
         self.assertEqual(Teams.objects.count(), initial_counts["teams"])
         self.assertEqual(Coach.objects.count(), initial_counts["coaches"])
         self.assertEqual(User.objects.count(), initial_counts["users"])

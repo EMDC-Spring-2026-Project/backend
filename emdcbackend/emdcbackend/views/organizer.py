@@ -290,7 +290,16 @@ def organizer_disqualify_team(request):
         return Response({"detail": "teamid and organizer_disqualified are required."}, status=status.HTTP_400_BAD_REQUEST)
     team = get_object_or_404(Teams, id=team_id)
     if not _can_manage_team(request.user, team.id):
-        return Response({"detail": "You are not allowed to disqualify this team."}, status=status.HTTP_403_FORBIDDEN)
+        return Response(
+            {
+                "detail": (
+                    "You can disqualify this team only if you manage every contest it "
+                    "belongs to. Ask an administrator if the team is shared with "
+                    "another contest."
+                )
+            },
+            status=status.HTTP_403_FORBIDDEN,
+        )
     disqualified = request.data["organizer_disqualified"]
     if isinstance(disqualified, str):
         normalized = disqualified.strip().lower()

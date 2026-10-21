@@ -1,3 +1,5 @@
+import logging
+
 from .Maps.MapClusterToContest import get_all_teams_cluster
 from ..models import Teams, Scoresheet, MapScoresheetToTeamJudge, MapContestToTeam, MapClusterToTeam, \
     MapCoachToTeam, MapUserToRole, Coach, Judge, MapJudgeToCluster, Contest, JudgeClusters, MapContestToCluster, \
@@ -24,6 +26,32 @@ from django.contrib.auth.models import User
 from django.shortcuts import get_object_or_404
 from django.http import Http404
 from django.db import transaction
+
+
+logger = logging.getLogger(__name__)
+
+
+class ScoresheetGenerationError(Exception):
+    """Raised when team setup cannot create the required scoresheets."""
+
+
+def _make_sheets_for_team_or_raise(team_id, cluster_id):
+    try:
+        return make_sheets_for_team(team_id, cluster_id)
+    except Exception as exc:
+        logger.exception(
+            "Scoresheet generation failed during setup for team %s in cluster %s",
+            team_id,
+            cluster_id,
+        )
+        raise ScoresheetGenerationError from exc
+
+
+SCORESHEET_SETUP_ERROR = (
+    "Team setup could not create its required scoresheets. No team or coach changes "
+    "were saved. Check the contest's judge and cluster setup, then retry. If the "
+    "problem continues, contact an administrator."
+)
 
 
 def _can_manage_team(user, team_id):
@@ -220,7 +248,9 @@ def create_team(request):
                 responses.append(other_cluster_mapping_response)
 
             # Step 6: Create scoresheets for all judges in the cluster
-            make_sheets_for_team(team_response.get("id"), request.data["clusterid"])
+            _make_sheets_for_team_or_raise(
+                team_response.get("id"), request.data["clusterid"]
+            )
             
             # Step 7: Check responses and return
             return Response({
@@ -232,6 +262,11 @@ def create_team(request):
                 "team_to_cluster_map": responses[3] if len(responses) > 3 else None
             }, status=status.HTTP_201_CREATED)
 
+    except ScoresheetGenerationError:
+        return Response(
+            {"detail": SCORESHEET_SETUP_ERROR},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
     except ParseError as e:
         return Response({"detail": str(e.detail)}, status=status.HTTP_400_BAD_REQUEST)
     except ValidationError as e:
@@ -253,7 +288,16 @@ def edit_team(request):
                 return Response({"detail": "id is required."}, status=status.HTTP_400_BAD_REQUEST)
             team = get_object_or_404(Teams, id=team_id)
             if not _can_manage_team(request.user, team.id):
-                return Response({"detail": "You cannot manage this team."}, status=status.HTTP_403_FORBIDDEN)
+                return Response(
+                    {
+                        "detail": (
+                            "You can manage this team only if you manage every contest "
+                            "it belongs to. Ask an administrator if the team is shared "
+                            "with another contest."
+                        )
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
             coach_team_mapping = get_object_or_404(MapCoachToTeam, teamid=team.id)
             coach = get_object_or_404(Coach, id=coach_team_mapping.coachid)
             try:
@@ -411,7 +455,16 @@ def delete_team_by_id(request, team_id):
     """
     team = get_object_or_404(Teams, id=team_id)
     if not _can_manage_team(request.user, team.id):
-        return Response({"detail": "You cannot manage this team."}, status=status.HTTP_403_FORBIDDEN)
+        return Response(
+            {
+                "detail": (
+                    "You can manage this team only if you manage every contest it "
+                    "belongs to. Ask an administrator if the team is shared with "
+                    "another contest."
+                )
+            },
+            status=status.HTTP_403_FORBIDDEN,
+        )
     try:
         with transaction.atomic():
             # Import here to avoid circulars at module import time
@@ -591,9 +644,8 @@ def create_team_after_judge(request):
           "clusterid": request.data["clusterid"],
           "teamid": team_response.get("id")
         }),
-        make_sheets_for_team(  # create score sheets for all judges in cluster and map them
-          teamid=team_response.get("id"),
-          clusterid=request.data["clusterid"]
+        _make_sheets_for_team_or_raise(  # create score sheets for all judges in cluster and map them
+          team_response.get("id"), request.data["clusterid"]
         )
       ]
 
@@ -610,6 +662,11 @@ def create_team_after_judge(request):
         "score sheets": responses[3],
       },status=status.HTTP_201_CREATED)
     
+  except ScoresheetGenerationError:
+    return Response(
+      {"detail": SCORESHEET_SETUP_ERROR},
+      status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    )
   except ParseError as e:
     return Response({"detail": str(e.detail)}, status=status.HTTP_400_BAD_REQUEST)
   except ValidationError as e:  # Catching ValidationErrors specifically
