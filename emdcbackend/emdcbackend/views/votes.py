@@ -12,12 +12,15 @@ from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from ..models import Votes
 from ..serializers import VotesSerializer
+from ..permissions import is_admin_user
 
 # Votes Views
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def create_vote(request):
+    if not is_admin_user(request.user):
+        return Response({"detail": "Admin access is required."}, status=status.HTTP_403_FORBIDDEN)
     try:
         serializer = VotesSerializer(data=request.data)
         if serializer.is_valid():
@@ -31,6 +34,8 @@ def create_vote(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def get_all_votes(request):
+    if not is_admin_user(request.user):
+        return Response({"detail": "Admin access is required."}, status=status.HTTP_403_FORBIDDEN)
     try:
         votes = Votes.objects.all()
         serializer = VotesSerializer(votes, many=True)

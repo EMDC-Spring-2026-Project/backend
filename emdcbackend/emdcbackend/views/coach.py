@@ -9,6 +9,8 @@ from rest_framework.response import Response
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from django.shortcuts import get_object_or_404
+from django.http import Http404
+from django.db import transaction
 
 from ..auth.views import create_user
 from ..models import Coach
@@ -23,6 +25,19 @@ def _is_admin(user):
     return user.is_superuser or MapUserToRole.objects.filter(
         uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
     ).exists()
+
+
+def _send_coach_set_password_email(user_id):
+    """Send onboarding only after the surrounding database work commits."""
+    try:
+        user = User.objects.get(id=user_id)
+        print(f"[INFO] Sending set-password email to NEW coach: {user.username}")
+        send_set_password_email(
+            user, subject="Set your EMDC Coach account password"
+        )
+        print(f"[SUCCESS] Set-password email sent successfully to: {user.username}")
+    except Exception as exc:
+        print(f"[ERROR] Failed to send set-password email to coach user {user_id}: {exc}")
 
 
 def _can_edit_coach(user, coach_id):
@@ -64,12 +79,14 @@ def create_coach(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def edit_coach(request):
-    coach = get_object_or_404(Coach, id=request.data["id"])
+    coach_id = request.data.get("id")
+    if coach_id is None:
+        return Response({"detail": "id is required."}, status=status.HTTP_400_BAD_REQUEST)
+    coach = get_object_or_404(Coach, id=coach_id)
     if not _can_edit_coach(request.user, coach.id):
         return Response({"detail": "You cannot edit this coach profile."}, status=status.HTTP_403_FORBIDDEN)
-    coach.first_name = request.data["first_name"]
-    coach.last_name = request.data["last_name"]
-    coach.school_name = request.data["school_name"]
+    coach.first_name = request.data.get("first_name", coach.first_name)
+    coach.last_name = request.data.get("last_name", coach.last_name)
     coach.save()
 
     serializer = CoachSerializer(instance=coach)
@@ -108,6 +125,8 @@ def delete_coach(request, coach_id):
         delete_user(user_id)
         return Response({"Detail": "Coach deleted successfully."}, status=status.HTTP_200_OK)
     except Coach.DoesNotExist:
+        return Response({"error": "Coach not found."}, status=status.HTTP_404_NOT_FOUND)
+    except Http404:
         return Response({"error": "Coach not found."}, status=status.HTTP_404_NOT_FOUND)
     except MapUserToRole.DoesNotExist:
         return Response({"error": "Coach mapping not found."}, status=status.HTTP_404_NOT_FOUND)
@@ -162,14 +181,11 @@ def create_user_and_coach(data):
     # Send set-password email to the coach
     user_id = user_response.get("user", {}).get("id")
     if user_id:
-        try:
-            user = User.objects.get(id=user_id)
-            print(f"[INFO] Sending set-password email to NEW coach: {user.username}")
-            send_set_password_email(user, subject="Set your EMDC Coach account password")
-            print(f"[SUCCESS] Set-password email sent successfully to: {user.username}")
-        except Exception as e:
-            # Log error but don't fail coach creation if email fails
-            print(f"[ERROR] Failed to send set-password email to coach {user.username}: {e}")
+        transaction.on_commit(
+            lambda committed_user_id=user_id: _send_coach_set_password_email(
+                committed_user_id
+            )
+        )
     
     return user_response, coach_response
 

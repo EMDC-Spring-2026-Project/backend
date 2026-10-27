@@ -9,6 +9,7 @@ This file is written to work for:
 
 import os
 from pathlib import Path
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -59,6 +60,11 @@ SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-secret-key-change-me")
 #   - In dev: DEBUG=True
 #   - In prod: set DEBUG=0 in environment (or remove .local.env which sets it)
 DEBUG = _env_bool("DEBUG", default=True)
+
+if not DEBUG and (not SECRET_KEY.strip() or SECRET_KEY == "dev-secret-key-change-me"):
+    raise ImproperlyConfigured(
+        "DJANGO_SECRET_KEY must be set to a non-default value when DEBUG is disabled."
+    )
 
 # ALLOWED_HOSTS:
 

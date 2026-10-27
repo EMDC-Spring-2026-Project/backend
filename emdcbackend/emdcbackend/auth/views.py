@@ -34,6 +34,15 @@ from .password_utils import send_set_password_email
 from ..views.Maps.MapUserToRole import get_role
 
 
+def _send_set_password_email_after_commit(user_id):
+    try:
+        send_set_password_email(User.objects.get(id=user_id))
+    except Exception as exc:
+        # Account creation should remain successful if the mail provider is
+        # temporarily unavailable.
+        print(f"[WARN] Failed to send set-password email: {exc}")
+
+
 
 # -----------------------
 # Session-based login/logout (HttpOnly cookies)
@@ -325,11 +334,10 @@ def create_user(user_data, send_email: bool = True, enforce_unusable_password: b
 
             user.save()
             if send_email:
-                try:
-                    send_set_password_email(user)
-                except Exception as e:
-                    # Do not fail creation if email fails (useful in dev)
-                    print(f"[WARN] Failed to send set-password email: {e}")
+                transaction.on_commit(
+                    lambda committed_user_id=user.id:
+                    _send_set_password_email_after_commit(committed_user_id)
+                )
 
             # Return serialized new user (match original return structure)
             return {"user": UserSerializer(instance=user).data}

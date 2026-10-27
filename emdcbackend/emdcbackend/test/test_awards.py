@@ -168,3 +168,78 @@ class AwardAPITests(APITestCase):
             format='json',
         )
         self.assertEqual(denied_response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_organizer_cannot_take_award_from_another_contest(self):
+        managed_contest = Contest.objects.create(
+            name="Managed Contest", date=date.today(), is_open=True, is_tabulated=False
+        )
+        other_contest = Contest.objects.create(
+            name="Unmanaged Contest", date=date.today(), is_open=True, is_tabulated=False
+        )
+        managed_team = Teams.objects.create(team_name="Managed Team")
+        other_team = Teams.objects.create(team_name="Unmanaged Team")
+        MapContestToTeam.objects.create(contestid=managed_contest.id, teamid=managed_team.id)
+        MapContestToTeam.objects.create(contestid=other_contest.id, teamid=other_team.id)
+        organizer = Organizer.objects.create(first_name="Contest", last_name="Organizer")
+        organizer_user = User.objects.create_user(
+            username="contest-organizer@example.com", password="testpassword"
+        )
+        MapUserToRole.objects.create(uuid=organizer_user.id, role=2, relatedid=organizer.id)
+        MapContestToOrganizer.objects.create(
+            contestid=managed_contest.id, organizerid=organizer.id
+        )
+        award = SpecialAward.objects.create(
+            teamid=other_team.id, award_name="Protected Organizer Award", isJudge=False
+        )
+        self.client.force_authenticate(user=organizer_user)
+
+        response = self.client.put(
+            reverse(
+                'update_award_team_mapping',
+                args=[award.teamid, award.award_name],
+            ),
+            {"teamid": managed_team.id, "award_name": award.award_name, "isJudge": False},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        award.refresh_from_db()
+        self.assertEqual(award.teamid, other_team.id)
+
+    def test_judge_cannot_take_award_from_another_contest(self):
+        managed_contest = Contest.objects.create(
+            name="Judge Managed Contest", date=date.today(), is_open=True, is_tabulated=False
+        )
+        other_contest = Contest.objects.create(
+            name="Judge Unmanaged Contest", date=date.today(), is_open=True, is_tabulated=False
+        )
+        managed_team = Teams.objects.create(team_name="Judge Managed Team")
+        other_team = Teams.objects.create(team_name="Judge Unmanaged Team")
+        MapContestToTeam.objects.create(contestid=managed_contest.id, teamid=managed_team.id)
+        MapContestToTeam.objects.create(contestid=other_contest.id, teamid=other_team.id)
+        judge = Judge.objects.create(
+            first_name="Contest", last_name="Judge", phone_number="5559876543",
+            contestid=managed_contest.id, presentation=True, journal=True, mdo=False,
+        )
+        judge_user = User.objects.create_user(
+            username="contest-judge@example.com", password="testpassword"
+        )
+        MapUserToRole.objects.create(uuid=judge_user.id, role=3, relatedid=judge.id)
+        MapContestToJudge.objects.create(contestid=managed_contest.id, judgeid=judge.id)
+        award = SpecialAward.objects.create(
+            teamid=other_team.id, award_name="Protected Judge Award", isJudge=True
+        )
+        self.client.force_authenticate(user=judge_user)
+
+        response = self.client.put(
+            reverse(
+                'update_award_team_mapping',
+                args=[award.teamid, award.award_name],
+            ),
+            {"teamid": managed_team.id, "award_name": award.award_name, "isJudge": True},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        award.refresh_from_db()
+        self.assertEqual(award.teamid, other_team.id)

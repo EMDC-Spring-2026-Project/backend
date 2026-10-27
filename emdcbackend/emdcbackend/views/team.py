@@ -1,6 +1,9 @@
+import logging
+
 from .Maps.MapClusterToContest import get_all_teams_cluster
 from ..models import Teams, Scoresheet, MapScoresheetToTeamJudge, MapContestToTeam, MapClusterToTeam, \
-    MapCoachToTeam, MapUserToRole, Coach, Judge, MapJudgeToCluster
+    MapCoachToTeam, MapUserToRole, Coach, Judge, MapJudgeToCluster, Contest, JudgeClusters, MapContestToCluster, \
+    MapContestToJudge, MapContestToOrganizer
 from .coach import create_coach, create_user_and_coach, get_coach
 from ..serializers import TeamSerializer, ScoresheetSerializer, CoachSerializer
 from .scoresheets import create_score_sheets_for_team, make_sheets_for_team
@@ -15,13 +18,40 @@ from rest_framework.decorators import (
     authentication_classes,
     permission_classes,
 )
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import ParseError, ValidationError
 from rest_framework.response import Response
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth.models import User
 from django.shortcuts import get_object_or_404
+from django.http import Http404
 from django.db import transaction
+
+
+logger = logging.getLogger(__name__)
+
+
+class ScoresheetGenerationError(Exception):
+    """Raised when team setup cannot create the required scoresheets."""
+
+
+def _make_sheets_for_team_or_raise(team_id, cluster_id):
+    try:
+        return make_sheets_for_team(team_id, cluster_id)
+    except Exception as exc:
+        logger.exception(
+            "Scoresheet generation failed during setup for team %s in cluster %s",
+            team_id,
+            cluster_id,
+        )
+        raise ScoresheetGenerationError from exc
+
+
+SCORESHEET_SETUP_ERROR = (
+    "Team setup could not create its required scoresheets. No team or coach changes "
+    "were saved. Check the contest's judge and cluster setup, then retry. If the "
+    "problem continues, contact an administrator."
+)
 
 
 def _can_manage_team(user, team_id):
@@ -43,15 +73,79 @@ def _can_manage_contest(user, contest_id):
     organizer_ids = MapUserToRole.objects.filter(
         uuid=user.id, role=MapUserToRole.RoleEnum.ORGANIZER
     ).values_list("relatedid", flat=True)
-    from ..models import MapContestToOrganizer
     return MapContestToOrganizer.objects.filter(
         contestid=contest_id, organizerid__in=organizer_ids
     ).exists()
 
+
+def _visible_team_ids(user):
+    """Return only teams the signed-in role needs for its contest work."""
+    role_mappings = MapUserToRole.objects.filter(uuid=user.id)
+    if user.is_superuser or role_mappings.filter(
+        role=MapUserToRole.RoleEnum.ADMIN
+    ).exists():
+        return Teams.objects.values_list("id", flat=True)
+
+    contest_ids = set()
+    organizer_ids = role_mappings.filter(
+        role=MapUserToRole.RoleEnum.ORGANIZER
+    ).values_list("relatedid", flat=True)
+    contest_ids.update(MapContestToOrganizer.objects.filter(
+        organizerid__in=organizer_ids
+    ).values_list("contestid", flat=True))
+
+    judge_ids = role_mappings.filter(
+        role=MapUserToRole.RoleEnum.JUDGE
+    ).values_list("relatedid", flat=True)
+    contest_ids.update(MapContestToJudge.objects.filter(
+        judgeid__in=judge_ids
+    ).values_list("contestid", flat=True))
+
+    team_ids = set(MapContestToTeam.objects.filter(
+        contestid__in=contest_ids
+    ).values_list("teamid", flat=True))
+    coach_ids = role_mappings.filter(
+        role=MapUserToRole.RoleEnum.COACH
+    ).values_list("relatedid", flat=True)
+    team_ids.update(MapCoachToTeam.objects.filter(
+        coachid__in=coach_ids
+    ).values_list("teamid", flat=True))
+    return team_ids
+
+
+def _validate_team_assignment(user, data):
+    for field in ("username", "contestid", "clusterid"):
+        if data.get(field) in (None, ""):
+            raise ValidationError({field: f"{field} is required."})
+
+    contest_id = data["contestid"]
+    cluster_id = data["clusterid"]
+    if not Contest.objects.filter(id=contest_id).exists():
+        raise ValidationError({"contestid": "Contest not found."})
+    if not _can_manage_contest(user, contest_id):
+        return Response(
+            {"detail": "You cannot manage this contest."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if not JudgeClusters.objects.filter(id=cluster_id).exists():
+        raise ValidationError({"clusterid": "Cluster not found."})
+    if not MapContestToCluster.objects.filter(
+        contestid=contest_id, clusterid=cluster_id
+    ).exists():
+        raise ValidationError({"clusterid": "Cluster does not belong to this contest."})
+    return None
+
 # Get team by ID
 @api_view(["GET"])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
 def team_by_id(request, team_id):
     team = get_object_or_404(Teams, id=team_id)
+    if team.id not in _visible_team_ids(request.user):
+        return Response(
+            {"detail": "You cannot view this team."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     serializer = TeamSerializer(instance=team)
     return Response({"Team": serializer.data}, status=status.HTTP_200_OK)
 
@@ -63,15 +157,9 @@ def team_by_id(request, team_id):
 def create_team(request):
     try:
         with transaction.atomic():
-            # Validate required fields
-            if "username" not in request.data:
-                raise ValidationError({"username": "Username is required."})
-            if "contestid" not in request.data:
-                raise ValidationError({"contestid": "Contest ID is required."})
-            if "clusterid" not in request.data:
-                raise ValidationError({"clusterid": "Cluster ID is required."})
-            if not _can_manage_contest(request.user, request.data["contestid"]):
-                return Response({"detail": "You cannot manage this contest."}, status=status.HTTP_403_FORBIDDEN)
+            assignment_error = _validate_team_assignment(request.user, request.data)
+            if assignment_error:
+                return assignment_error
             
             # Step 1: Create team object
             team_response = make_team(request.data)
@@ -123,7 +211,7 @@ def create_team(request):
                 "coachid": coach_response.get("id")
             })
             if isinstance(coach_to_team_response, Response):
-                return coach_to_team_response
+                raise ValidationError(coach_to_team_response.data)
             responses.append(coach_to_team_response)
 
             # Create team to contest map
@@ -132,7 +220,7 @@ def create_team(request):
                 "teamid": team_response.get("id")
             })
             if isinstance(team_to_contest_response, Response):
-                return team_to_contest_response
+                raise ValidationError(team_to_contest_response.data)
             responses.append(team_to_contest_response)
 
             # Step 4: Map team to the "All Teams" cluster (default cluster)
@@ -156,16 +244,13 @@ def create_team(request):
                     "teamid": team_response.get("id")
                 })
                 if isinstance(other_cluster_mapping_response, Response):
-                    return other_cluster_mapping_response
+                    raise ValidationError(other_cluster_mapping_response.data)
                 responses.append(other_cluster_mapping_response)
 
             # Step 6: Create scoresheets for all judges in the cluster
-            try:
-                make_sheets_for_team(team_response.get("id"), request.data["clusterid"])
-            except Exception as e:
-                # Don't fail the team creation if scoresheet creation fails
-                # Just log the error and continue
-                pass
+            _make_sheets_for_team_or_raise(
+                team_response.get("id"), request.data["clusterid"]
+            )
             
             # Step 7: Check responses and return
             return Response({
@@ -177,6 +262,13 @@ def create_team(request):
                 "team_to_cluster_map": responses[3] if len(responses) > 3 else None
             }, status=status.HTTP_201_CREATED)
 
+    except ScoresheetGenerationError:
+        return Response(
+            {"detail": SCORESHEET_SETUP_ERROR},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+    except ParseError as e:
+        return Response({"detail": str(e.detail)}, status=status.HTTP_400_BAD_REQUEST)
     except ValidationError as e:
         # Specific error handling for validation errors
         return Response({"errors": e.detail}, status=status.HTTP_400_BAD_REQUEST)
@@ -191,9 +283,21 @@ def edit_team(request):
     try:
         with transaction.atomic():
             # Retrieve team, coach, and user details
-            team = get_object_or_404(Teams, id=request.data["id"])
+            team_id = request.data.get("id")
+            if team_id is None:
+                return Response({"detail": "id is required."}, status=status.HTTP_400_BAD_REQUEST)
+            team = get_object_or_404(Teams, id=team_id)
             if not _can_manage_team(request.user, team.id):
-                return Response({"detail": "You cannot manage this team."}, status=status.HTTP_403_FORBIDDEN)
+                return Response(
+                    {
+                        "detail": (
+                            "You can manage this team only if you manage every contest "
+                            "it belongs to. Ask an administrator if the team is shared "
+                            "with another contest."
+                        )
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
             coach_team_mapping = get_object_or_404(MapCoachToTeam, teamid=team.id)
             coach = get_object_or_404(Coach, id=coach_team_mapping.coachid)
             try:
@@ -253,10 +357,10 @@ def edit_team(request):
                 # Username hasn't changed - update coach details if changed
         
                 coach_updated = False
-                if request.data["first_name"] != coach.first_name:
+                if "first_name" in request.data and request.data["first_name"] != coach.first_name:
                     coach.first_name = request.data["first_name"]
                     coach_updated = True
-                if request.data["last_name"] != coach.last_name:
+                if "last_name" in request.data and request.data["last_name"] != coach.last_name:
                     coach.last_name = request.data["last_name"]
                     coach_updated = True
                 if coach_updated:
@@ -331,6 +435,8 @@ def edit_team(request):
             score_sheets = Scoresheet.objects.filter(id__in=score_sheet_ids)
             score_sheets_data = ScoresheetSerializer(score_sheets, many=True).data
 
+    except Http404:
+        return Response({"error": "Team or coach record not found."}, status=status.HTTP_404_NOT_FOUND)
     except ValidationError as e:
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
@@ -349,7 +455,16 @@ def delete_team_by_id(request, team_id):
     """
     team = get_object_or_404(Teams, id=team_id)
     if not _can_manage_team(request.user, team.id):
-        return Response({"detail": "You cannot manage this team."}, status=status.HTTP_403_FORBIDDEN)
+        return Response(
+            {
+                "detail": (
+                    "You can manage this team only if you manage every contest it "
+                    "belongs to. Ask an administrator if the team is shared with "
+                    "another contest."
+                )
+            },
+            status=status.HTTP_403_FORBIDDEN,
+        )
     try:
         with transaction.atomic():
             # Import here to avoid circulars at module import time
@@ -481,6 +596,9 @@ def get_teams_by_team_rank(request):
 def create_team_after_judge(request):
   try:
     with transaction.atomic():
+      assignment_error = _validate_team_assignment(request.user, request.data)
+      if assignment_error:
+        return assignment_error
       # create team object.
       team_response = make_team(request.data)
       
@@ -526,15 +644,14 @@ def create_team_after_judge(request):
           "clusterid": request.data["clusterid"],
           "teamid": team_response.get("id")
         }),
-        make_sheets_for_team(  # create score sheets for all judges in cluster and map them
-          teamid=team_response.get("id"),
-          clusterid=request.data["clusterid"]
+        _make_sheets_for_team_or_raise(  # create score sheets for all judges in cluster and map them
+          team_response.get("id"), request.data["clusterid"]
         )
       ]
 
       for response in responses:
         if isinstance(response, Response):
-          return response
+          raise ValidationError(response.data)
         
       return Response({
         "team":team_response,
@@ -545,6 +662,13 @@ def create_team_after_judge(request):
         "score sheets": responses[3],
       },status=status.HTTP_201_CREATED)
     
+  except ScoresheetGenerationError:
+    return Response(
+      {"detail": SCORESHEET_SETUP_ERROR},
+      status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    )
+  except ParseError as e:
+    return Response({"detail": str(e.detail)}, status=status.HTTP_400_BAD_REQUEST)
   except ValidationError as e:  # Catching ValidationErrors specifically
     return Response({"errors": e.detail}, status=status.HTTP_400_BAD_REQUEST)
   
@@ -554,8 +678,8 @@ def create_team_after_judge(request):
 @api_view(["GET"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
-def is_team_disqualified(request):
-    team = get_object_or_404(Teams, id=request.data["teamid"])
+def is_team_disqualified(request, team_id):
+    team = get_object_or_404(Teams, id=team_id)
     return Response({"is disqualified": team.organizer_disqualified}, status=status.HTTP_200_OK)
 
 # GET request that returns all teams
@@ -564,7 +688,7 @@ def is_team_disqualified(request):
 @permission_classes([IsAuthenticated])
 def get_all_teams(request):
     try:
-        teams = Teams.objects.all()
+        teams = Teams.objects.filter(id__in=_visible_team_ids(request.user))
         serializer = TeamSerializer(teams, many=True)
         return Response({"teams": serializer.data}, status=status.HTTP_200_OK)
 

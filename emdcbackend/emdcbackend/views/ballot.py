@@ -12,12 +12,15 @@ from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from ..models import Ballot
 from ..serializers import BallotSerializer
+from ..permissions import is_admin_user
 
 # Ballot Views
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def create_ballot(request):
+    if not is_admin_user(request.user):
+        return Response({"detail": "Admin access is required."}, status=status.HTTP_403_FORBIDDEN)
     try:
         serializer = BallotSerializer(data=request.data)
         if serializer.is_valid():
@@ -31,6 +34,8 @@ def create_ballot(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def get_all_ballots(request):
+    if not is_admin_user(request.user):
+        return Response({"detail": "Admin access is required."}, status=status.HTTP_403_FORBIDDEN)
     try:
         ballots = Ballot.objects.all()
         serializer = BallotSerializer(ballots, many=True)
@@ -42,6 +47,8 @@ def get_all_ballots(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def delete_ballot(request, ballot_id):
+    if not is_admin_user(request.user):
+        return Response({"detail": "Admin access is required."}, status=status.HTTP_403_FORBIDDEN)
     try:
         ballot = Ballot.objects.get(id=ballot_id)
         ballot.delete()

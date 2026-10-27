@@ -78,9 +78,17 @@ def get_contest_id_by_team_id(request,team_id):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def get_contests_by_team_ids(request):
+    if not isinstance(request.data, list) or not all(
+        isinstance(team, dict) and isinstance(team.get("id"), int) and team["id"] > 0
+        for team in request.data
+    ):
+        return Response(
+            {"detail": "Request body must be a list of teams with positive integer id values."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     try:
-        # Extract team IDs from the request data
-        team_ids = [team["id"] for team in request.data if "id" in team]
+        team_ids = [team["id"] for team in request.data]
 
         # Fetch mappings for the specified team IDs
         mappings = MapContestToTeam.objects.filter(teamid__in=team_ids)

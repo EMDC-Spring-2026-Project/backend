@@ -60,6 +60,20 @@ class CoachAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['coach']['first_name'], "Updated")
 
+    def test_edit_coach_accepts_partial_request(self):
+        coach = Coach.objects.create(first_name="Original", last_name="Coach")
+
+        response = self.client.post(
+            reverse('edit_coach'),
+            {"id": coach.id, "first_name": "Updated"},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        coach.refresh_from_db()
+        self.assertEqual(coach.first_name, "Updated")
+        self.assertEqual(coach.last_name, "Coach")
+
     def test_delete_coach(self):
         coach = Coach.objects.create(first_name="To Delete", last_name="Coach")
         
@@ -69,10 +83,10 @@ class CoachAPITests(APITestCase):
         
         url = reverse('delete_coach', args=[coach.id])
         response = self.client.delete(url)
-        # Note: Delete might fail if there are dependencies, so we check for either success or expected error
-        if response.status_code == status.HTTP_200_OK:
-            self.assertFalse(Coach.objects.filter(id=coach.id).exists())
-        else:
-            # If it fails, it's likely due to missing dependencies - that's okay for now
-            self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_500_INTERNAL_SERVER_ERROR])
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertFalse(Coach.objects.filter(id=coach.id).exists())
 
+    def test_delete_missing_coach_returns_not_found(self):
+        response = self.client.delete(reverse('delete_coach', args=[999999]))
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)

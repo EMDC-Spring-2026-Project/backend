@@ -8,10 +8,25 @@ from rest_framework.response import Response
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from django.shortcuts import get_object_or_404
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.http import Http404
 from rest_framework.exceptions import ValidationError
 from .Maps.MapScoreSheet import delete_score_sheet_mapping
-from ..models import Scoresheet, Teams, Judge, MapClusterToTeam, MapScoresheetToTeamJudge, MapJudgeToCluster, ScoresheetEnum, Contest, MapContestToTeam, MapContestToCluster, MapContestToOrganizer, MapUserToRole
+from ..models import Scoresheet, Teams, Judge, MapClusterToTeam, MapScoresheetToTeamJudge, MapJudgeToCluster, ScoresheetEnum, Contest, MapContestToTeam, MapContestToCluster, MapContestToOrganizer, MapContestToJudge, MapCoachToTeam, MapUserToRole
 from ..serializers import ScoresheetSerializer, MapScoreSheetToTeamJudgeSerializer
+
+
+def _parse_boolean(value, field_name="value"):
+    """Accept JSON booleans and unambiguous form-encoded boolean strings."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise DjangoValidationError({field_name: "Must be true or false."})
 
 
 def _can_edit_scoresheet(user, scoresheet):
@@ -44,6 +59,64 @@ def _can_edit_scoresheet(user, scoresheet):
     ).values_list("contestid", flat=True))
     return contest_ids.issubset(managed_contest_ids)
 
+
+def _is_admin(user):
+    return user.is_superuser or MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
+    ).exists()
+
+
+def _can_view_contest_scores(user, contest_id, judge_id):
+    if _is_admin(user):
+        return True
+
+    role_mappings = MapUserToRole.objects.filter(uuid=user.id)
+    judge_ids = role_mappings.filter(
+        role=MapUserToRole.RoleEnum.JUDGE
+    ).values_list("relatedid", flat=True)
+    if judge_id in judge_ids and MapContestToJudge.objects.filter(
+        contestid=contest_id, judgeid=judge_id
+    ).exists():
+        return True
+
+    organizer_ids = role_mappings.filter(
+        role=MapUserToRole.RoleEnum.ORGANIZER
+    ).values_list("relatedid", flat=True)
+    return MapContestToOrganizer.objects.filter(
+        contestid=contest_id, organizerid__in=organizer_ids
+    ).exists()
+
+
+def _can_view_team_score_details(user, team_id):
+    if _is_admin(user):
+        return True
+
+    role_mappings = MapUserToRole.objects.filter(uuid=user.id)
+    judge_ids = role_mappings.filter(
+        role=MapUserToRole.RoleEnum.JUDGE
+    ).values_list("relatedid", flat=True)
+    if MapScoresheetToTeamJudge.objects.filter(
+        teamid=team_id, judgeid__in=judge_ids
+    ).exists():
+        return True
+
+    coach_ids = role_mappings.filter(
+        role=MapUserToRole.RoleEnum.COACH
+    ).values_list("relatedid", flat=True)
+    if MapCoachToTeam.objects.filter(teamid=team_id, coachid__in=coach_ids).exists():
+        return True
+
+    contest_ids = set(MapContestToTeam.objects.filter(
+        teamid=team_id
+    ).values_list("contestid", flat=True))
+    organizer_ids = role_mappings.filter(
+        role=MapUserToRole.RoleEnum.ORGANIZER
+    ).values_list("relatedid", flat=True)
+    managed_contest_ids = set(MapContestToOrganizer.objects.filter(
+        contestid__in=contest_ids, organizerid__in=organizer_ids
+    ).values_list("contestid", flat=True))
+    return bool(contest_ids) and contest_ids.issubset(managed_contest_ids)
+
 @api_view(["GET"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -58,6 +131,11 @@ def scores_by_id(request, scores_id):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def create_score_sheet(request):
+    if not _is_admin(request.user):
+        return Response(
+            {"detail": "Only administrators can create scoresheets directly."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     map_data = request.data
     result = create_score_sheet_helper(map_data)
     if "errors" in result:
@@ -69,63 +147,51 @@ def create_score_sheet(request):
 @permission_classes([IsAuthenticated])
 def edit_score_sheet(request):
     try:
-        scores = get_object_or_404(Scoresheet, id=request.data["id"])
+        scores_id = request.data.get("id")
+        if scores_id is None:
+            return Response({"detail": "id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        scores = get_object_or_404(Scoresheet, id=scores_id)
         if not _can_edit_scoresheet(request.user, scores):
             return Response({"detail": "You cannot edit this scoresheet."}, status=status.HTTP_403_FORBIDDEN)
-        scores.sheetType = request.data["sheetType"]
-        scores.isSubmitted = request.data["isSubmitted"]
-        
+
+        requested_sheet_type = request.data.get("sheetType", scores.sheetType)
+        try:
+            requested_sheet_type = int(requested_sheet_type)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "sheetType must be a valid scoresheet type."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if requested_sheet_type != scores.sheetType:
+            return Response(
+                {"detail": "A scoresheet's type cannot be changed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if "isSubmitted" in request.data:
+            scores.isSubmitted = _parse_boolean(
+                request.data["isSubmitted"], "isSubmitted"
+            )
+
         if scores.sheetType == ScoresheetEnum.OTHERPENALTIES:
-            scores.field1 = request.data.get("field1", 0)
-            scores.field2 = request.data.get("field2", 0)
-            scores.field3 = request.data.get("field3", 0)
-            scores.field4 = request.data.get("field4", 0)
-            scores.field5 = request.data.get("field5", 0)
-            scores.field6 = request.data.get("field6", 0)
-            scores.field7 = request.data.get("field7", 0)
+            editable_field_numbers = range(1, 8)
         elif scores.sheetType == ScoresheetEnum.REDESIGN:
-            scores.field1 = request.data.get("field1", 0)
-            scores.field2 = request.data.get("field2", 0)
-            scores.field3 = request.data.get("field3", 0)
-            scores.field4 = request.data.get("field4", 0)
-            scores.field5 = request.data.get("field5", 0)
-            scores.field6 = request.data.get("field6", 0)
-            scores.field7 = request.data.get("field7", 0)
-            scores.field9 = request.data.get("field9", "")
+            editable_field_numbers = (*range(1, 8), 9)
         elif scores.sheetType == ScoresheetEnum.CHAMPIONSHIP:
-            # Championship scoresheets: fields 1-42
-            # Fields 1-8: Machine Design
-            # Field 9: Machine Design comment
-            # Fields 10-17: Presentation  
-            # Field 18: Presentation comment
-            # Fields 19-25: General Penalties
-            # Fields 26-42: Run Penalties
-            for i in range(1, 43):
-                if i == 9 or i == 18:
-                    # Comment fields
-                    scores.__setattr__(f"field{i}", request.data.get(f"field{i}", ""))
-                else:
-                    # Score/penalty fields
-                    scores.__setattr__(f"field{i}", request.data.get(f"field{i}", 0))
+            editable_field_numbers = range(1, 43)
+        elif scores.sheetType == ScoresheetEnum.RUNPENALTIES:
+            editable_field_numbers = range(1, 18)
         else:
-            scores.field1 = request.data.get("field1", 0)
-            scores.field2 = request.data.get("field2", 0)
-            scores.field3 = request.data.get("field3", 0)
-            scores.field4 = request.data.get("field4", 0)
-            scores.field5 = request.data.get("field5", 0)
-            scores.field6 = request.data.get("field6", 0)
-            scores.field7 = request.data.get("field7", 0)
-            scores.field8 = request.data.get("field8", 0)
-            scores.field9 = request.data.get("field9", "")
-            if scores.sheetType == ScoresheetEnum.RUNPENALTIES:
-                scores.field10 = request.data.get("field10", 0)
-                scores.field11 = request.data.get("field11", 0)
-                scores.field12 = request.data.get("field12", 0)
-                scores.field13 = request.data.get("field13", 0)
-                scores.field14 = request.data.get("field14", 0)
-                scores.field15 = request.data.get("field15", 0)
-                scores.field16 = request.data.get("field16", 0)
-                scores.field17 = request.data.get("field17", 0)
+            editable_field_numbers = range(1, 10)
+
+        comment_fields = {"field9", "field18"}
+        for field_number in editable_field_numbers:
+            field_name = f"field{field_number}"
+            if field_name not in request.data:
+                continue
+            value = request.data.get(field_name)
+            if value is None:
+                value = "" if field_name in comment_fields else 0
+            setattr(scores, field_name, value)
         scores.save()
         
         # Trigger tabulation recalculation asynchronously for all scoresheet types when submitted
@@ -155,6 +221,10 @@ def edit_score_sheet(request):
         
         serializer = ScoresheetSerializer(instance=scores)
         return Response({"edit_score_sheets": serializer.data})
+    except Http404:
+        raise
+    except DjangoValidationError as e:
+        return Response({"errors": e.message_dict}, status=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -163,96 +233,38 @@ def edit_score_sheet(request):
 @permission_classes([IsAuthenticated])
 def update_scores(request):
     try:
-        scores = get_object_or_404(Scoresheet, id=request.data["id"])
+        scores_id = request.data.get("id")
+        if scores_id is None:
+            return Response({"detail": "id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        scores = get_object_or_404(Scoresheet, id=scores_id)
         if not _can_edit_scoresheet(request.user, scores):
             return Response({"detail": "You cannot edit this scoresheet."}, status=status.HTTP_403_FORBIDDEN)
         
-        # Update isSubmitted field if provided
         if "isSubmitted" in request.data:
-            scores.isSubmitted = request.data["isSubmitted"]
+            scores.isSubmitted = _parse_boolean(
+                request.data["isSubmitted"], "isSubmitted"
+            )
+
         if scores.sheetType == ScoresheetEnum.OTHERPENALTIES:
-            scores.field1 = request.data.get("field1") or 0
-            scores.field2 = request.data.get("field2") or 0
-            scores.field3 = request.data.get("field3") or 0
-            scores.field4 = request.data.get("field4") or 0
-            scores.field5 = request.data.get("field5") or 0
-            scores.field6 = request.data.get("field6") or 0
-            scores.field7 = request.data.get("field7") or 0
+            editable_field_numbers = range(1, 8)
         elif scores.sheetType == ScoresheetEnum.REDESIGN:
-            scores.field1 = request.data.get("field1") or 0
-            scores.field2 = request.data.get("field2") or 0
-            scores.field3 = request.data.get("field3") or 0
-            scores.field4 = request.data.get("field4") or 0
-            scores.field5 = request.data.get("field5") or 0
-            scores.field6 = request.data.get("field6") or 0
-            scores.field7 = request.data.get("field7") or 0
-            scores.field9 = request.data.get("field9") or ""
+            editable_field_numbers = (*range(1, 8), 9)
         elif scores.sheetType == ScoresheetEnum.CHAMPIONSHIP:
-            # Championship structure: fields 1-9 = Machine Design, fields 10-18 = Presentation
-            # Machine Design fields 1-9 (field9 is CharField for comments)
-            scores.field1 = request.data.get("field1") or 0
-            scores.field2 = request.data.get("field2") or 0
-            scores.field3 = request.data.get("field3") or 0
-            scores.field4 = request.data.get("field4") or 0
-            scores.field5 = request.data.get("field5") or 0
-            scores.field6 = request.data.get("field6") or 0
-            scores.field7 = request.data.get("field7") or 0
-            scores.field8 = request.data.get("field8") or 0
-            scores.field9 = request.data.get("field9") or ""  # Machine Design comment
-            # Presentation fields 10-18
-            scores.field10 = request.data.get("field10") or 0
-            scores.field11 = request.data.get("field11") or 0
-            scores.field12 = request.data.get("field12") or 0
-            scores.field13 = request.data.get("field13") or 0
-            scores.field14 = request.data.get("field14") or 0
-            scores.field15 = request.data.get("field15") or 0
-            scores.field16 = request.data.get("field16") or 0
-            scores.field17 = request.data.get("field17") or 0
-            scores.field18 = request.data.get("field18") or ""  # Presentation comment
-            # Penalty fields 19-42 (General Penalties: 19-25, Run Penalties: 26-42)
-            scores.field19 = request.data.get("field19") or 0
-            scores.field20 = request.data.get("field20") or 0
-            scores.field21 = request.data.get("field21") or 0
-            scores.field22 = request.data.get("field22") or 0
-            scores.field23 = request.data.get("field23") or 0
-            scores.field24 = request.data.get("field24") or 0
-            scores.field25 = request.data.get("field25") or 0
-            scores.field26 = request.data.get("field26") or 0
-            scores.field27 = request.data.get("field27") or 0
-            scores.field28 = request.data.get("field28") or 0
-            scores.field29 = request.data.get("field29") or 0
-            scores.field30 = request.data.get("field30") or 0
-            scores.field31 = request.data.get("field31") or 0
-            scores.field32 = request.data.get("field32") or 0
-            scores.field33 = request.data.get("field33") or 0
-            scores.field34 = request.data.get("field34") or 0
-            scores.field35 = request.data.get("field35") or 0
-            scores.field36 = request.data.get("field36") or 0
-            scores.field37 = request.data.get("field37") or 0
-            scores.field38 = request.data.get("field38") or 0
-            scores.field39 = request.data.get("field39") or 0
-            scores.field40 = request.data.get("field40") or 0
-            scores.field41 = request.data.get("field41") or 0
-            scores.field42 = request.data.get("field42") or 0
+            editable_field_numbers = range(1, 43)
+        elif scores.sheetType == ScoresheetEnum.RUNPENALTIES:
+            editable_field_numbers = range(1, 18)
         else:
-            scores.field1 = request.data.get("field1") or 0
-            scores.field2 = request.data.get("field2") or 0
-            scores.field3 = request.data.get("field3") or 0
-            scores.field4 = request.data.get("field4") or 0
-            scores.field5 = request.data.get("field5") or 0
-            scores.field6 = request.data.get("field6") or 0
-            scores.field7 = request.data.get("field7") or 0
-            scores.field8 = request.data.get("field8") or 0
-            scores.field9 = request.data.get("field9") or ""
-            if scores.sheetType == ScoresheetEnum.RUNPENALTIES:
-                scores.field10 = request.data.get("field10") or 0
-                scores.field11 = request.data.get("field11") or 0
-                scores.field12 = request.data.get("field12") or 0
-                scores.field13 = request.data.get("field13") or 0
-                scores.field14 = request.data.get("field14") or 0
-                scores.field15 = request.data.get("field15") or 0
-                scores.field16 = request.data.get("field16") or 0
-                scores.field17 = request.data.get("field17") or 0
+            editable_field_numbers = range(1, 10)
+
+        comment_fields = {"field9", "field18"}
+        for field_number in editable_field_numbers:
+            field_name = f"field{field_number}"
+            if field_name not in request.data:
+                continue
+            value = request.data.get(field_name)
+            if value is None:
+                value = "" if field_name in comment_fields else 0
+            setattr(scores, field_name, value)
             
         scores.save()
         
@@ -287,6 +299,10 @@ def update_scores(request):
                 pass
         
         return Response({"updated_sheet": serializer.data})
+    except DjangoValidationError as e:
+        return Response({"errors": e.message_dict}, status=status.HTTP_400_BAD_REQUEST)
+    except Http404:
+        raise
     except Exception as e:
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -294,23 +310,41 @@ def update_scores(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def edit_score_sheet_field(request):
-    sheet = get_object_or_404(Scoresheet, id=request.data["id"])
+    scores_id = request.data.get("id")
+    field = request.data.get("field")
+    if scores_id is None or field is None or "new_value" not in request.data:
+        return Response(
+            {"detail": "id, field, and new_value are required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    sheet = get_object_or_404(Scoresheet, id=scores_id)
     if not _can_edit_scoresheet(request.user, sheet):
         return Response({"detail": "You cannot edit this scoresheet."}, status=status.HTTP_403_FORBIDDEN)
 
     field_name = ""
-    if isinstance(request.data["field"], int):
-        field_name = "field"+str(request.data["field"])
+    if isinstance(field, int):
+        field_name = "field"+str(field)
     else:
-        field_name = request.data["field"]
+        field_name = field
 
-    if hasattr(sheet, field_name):
-        setattr(sheet, field_name, request.data["new_value"])
-        sheet.save()
-        serializer = ScoresheetSerializer(instance=sheet)
-        return Response({"score_sheet": serializer.data}, status=status.HTTP_200_OK)
-    else:
+    allowed_fields = {f"field{number}" for number in range(1, 43)} | {"isSubmitted"}
+    if field_name not in allowed_fields:
         return Response({"error": "Invalid field"}, status=status.HTTP_400_BAD_REQUEST)
+
+    new_value = request.data["new_value"]
+    if field_name == "isSubmitted":
+        try:
+            new_value = _parse_boolean(new_value, "new_value")
+        except DjangoValidationError as e:
+            return Response({"errors": e.message_dict}, status=status.HTTP_400_BAD_REQUEST)
+    setattr(sheet, field_name, new_value)
+    try:
+        sheet.save()
+    except DjangoValidationError as e:
+        return Response({"errors": e.message_dict}, status=status.HTTP_400_BAD_REQUEST)
+    serializer = ScoresheetSerializer(instance=sheet)
+    return Response({"score_sheet": serializer.data}, status=status.HTTP_200_OK)
 
 
 @api_view(["DELETE"])
@@ -459,25 +493,9 @@ def create_sheets_for_teams_in_cluster(judge_id, cluster_id, presentation, journ
         # Fetch all mappings for the teams in the cluster
         mappings = MapClusterToTeam.objects.filter(clusterid=cluster_id)
 
-        # Get team_ids either from direct mappings or contest relationship
-        if mappings.exists():
-            # Extract all the team_ids from the direct mappings
-            team_ids = mappings.values_list('teamid', flat=True)
-        else:
-            # Try to find teams through contest relationship
-            # If cluster belongs to a contest, create scoresheets for all teams in that contest
-            try:
-                contest_mapping = MapContestToCluster.objects.filter(clusterid=cluster_id).first()
-                if contest_mapping:
-                    contest_team_mappings = MapContestToTeam.objects.filter(contestid=contest_mapping.contestid)
-                    if contest_team_mappings.exists():
-                        team_ids = contest_team_mappings.values_list('teamid', flat=True)
-                    else:
-                        return []
-                else:
-                    return []
-            except Exception as e:
-                return []
+        if not mappings.exists():
+            return []
+        team_ids = mappings.values_list('teamid', flat=True)
 
         # Fetch all teams with the given team_ids
         teams_in_cluster = Teams.objects.filter(id__in=team_ids)
@@ -709,7 +727,7 @@ def create_scoresheets_for_judges_in_cluster(cluster_id):
             cluster = JudgeClusters.objects.get(id=cluster_id)
             cluster_type = getattr(cluster, 'cluster_type', 'preliminary')
         except JudgeClusters.DoesNotExist:
-            cluster_type = 'preliminary'
+            raise ValidationError({"cluster_id": "Cluster not found."})
 
         # Get all judges in this cluster
         judge_mappings = MapJudgeToCluster.objects.filter(clusterid=cluster_id)
@@ -776,8 +794,8 @@ def create_scoresheets_for_judges_in_cluster(cluster_id):
 
             except Judge.DoesNotExist:
                 continue
-            except Exception as e:
-                continue
+            except Exception:
+                raise
 
         return created_scoresheets
 
@@ -861,127 +879,50 @@ def delete_sheets_for_teams_in_cluster(judge_id, cluster_id, presentation, journ
   
 def make_sheets_for_team(teamid, clusterid):
     created_score_sheets = []
-    try:
-        # Get the team to check if it has advanced
-        try:
-            team = Teams.objects.get(id=teamid)
-            team_has_advanced = getattr(team, 'advanced_to_championship', False)
-        except Teams.DoesNotExist:
-            team_has_advanced = False
-        
-        judges = MapJudgeToCluster.objects.filter(clusterid=clusterid)  # get list of judge mappings
-        for judge_map in judges:
-            # Create score sheets for each type (Presentation, Journal, Machine Design, Run Penalties, Other Penalties) based on the judge's role
-            judge = Judge.objects.get(id=judge_map.judgeid)  # get judge from judge mapping
-            
-            # Skip preliminary scoresheets (1-5) if team has advanced - only create championship/redesign
-            if judge.presentation and not team_has_advanced:
-                sheet = create_base_score_sheet(1)
-                map_data = {"teamid": teamid, "judgeid": judge.id, "scoresheetid": sheet.id, "sheetType": 1}
-                map_serializer = MapScoreSheetToTeamJudgeSerializer(data=map_data)
-                if map_serializer.is_valid():
-                    map_serializer.save()
-                    created_score_sheets.append({
-                        "team_id": teamid,
-                        "judge_id": judge.id,
-                        "scoresheet_id": sheet.id,
-                        "sheetType": 1
-                    })
-                else:
-                    raise ValidationError(map_serializer.errors)
-            if judge.journal and not team_has_advanced:
-                sheet = create_base_score_sheet(2)
-                map_data = {"teamid": teamid, "judgeid": judge.id, "scoresheetid": sheet.id, "sheetType": 2}
-                map_serializer = MapScoreSheetToTeamJudgeSerializer(data=map_data)
-                if map_serializer.is_valid():
-                    map_serializer.save()
-                    created_score_sheets.append({
-                        "team_id": teamid,
-                        "judge_id": judge.id,
-                        "scoresheet_id": sheet.id,
-                        "sheetType": 2
-                    })
-                else:
-                    raise ValidationError(map_serializer.errors)
-            if judge.mdo and not team_has_advanced:
-                sheet = create_base_score_sheet(3)
-                map_data = {"teamid": teamid, "judgeid": judge.id, "scoresheetid": sheet.id, "sheetType": 3}
-                map_serializer = MapScoreSheetToTeamJudgeSerializer(data=map_data)
-                if map_serializer.is_valid():
-                    map_serializer.save()
-                    created_score_sheets.append({
-                        "team_id": teamid,
-                        "judge_id": judge.id,
-                        "scoresheet_id": sheet.id,
-                        "sheetType": 3
-                    })
-                else:
-                    raise ValidationError(map_serializer.errors)
-            if judge.runpenalties and not team_has_advanced:
-                sheet = create_base_score_sheet_runpenalties()
-                map_data = {"teamid": teamid, "judgeid": judge.id, "scoresheetid": sheet.id, "sheetType": 4}
-                map_serializer = MapScoreSheetToTeamJudgeSerializer(data=map_data)
-                if map_serializer.is_valid():
-                    map_serializer.save()
-                    created_score_sheets.append({
-                        "team_id": teamid,
-                        "judge_id": judge.id,
-                        "scoresheet_id": sheet.id,
-                        "sheetType": 4
-                    })
-                else:
-                    raise ValidationError(map_serializer.errors)
-            if judge.otherpenalties and not team_has_advanced:
-                sheet = create_base_score_sheet_otherpenalties()
-                map_data = {"teamid": teamid, "judgeid": judge.id, "scoresheetid": sheet.id, "sheetType": 5}
-                map_serializer = MapScoreSheetToTeamJudgeSerializer(data=map_data)
-                if map_serializer.is_valid():
-                    map_serializer.save()
-                    created_score_sheets.append({
-                        "team_id": teamid,
-                        "judge_id": judge.id,
-                        "scoresheet_id": sheet.id,
-                        "sheetType": 5
-                    })
-                else:
-                    raise ValidationError(map_serializer.errors)
-                created_score_sheets.append({
-                    "team_id": teamid,
-                    "judge_id": judge.id,
-                    "scoresheet_id": sheet.id,
-                    "sheetType": 5
-                })
-            else:
-                raise ValidationError(map_serializer.errors)
-        if judge.redesign:
-            sheet = create_base_score_sheet_Redesign()
-            map_data = {"teamid": teamid, "judgeid": judge.id, "scoresheetid": sheet.id, "sheetType": 6}
-            map_serializer = MapScoreSheetToTeamJudgeSerializer(data=map_data)
-            if map_serializer.is_valid():
-                map_serializer.save()
-                created_score_sheets.append({
-                    "team_id": teamid,
-                    "judge_id": judge.id,
-                    "scoresheet_id": sheet.id,
-                    "sheetType": 6
-                })
-        if judge.championship:
-            sheet = create_base_score_sheet_Championship()
-            map_data = {"teamid": teamid, "judgeid": judge.id, "scoresheetid": sheet.id, "sheetType": 7}
-            map_serializer = MapScoreSheetToTeamJudgeSerializer(data=map_data)
-            if map_serializer.is_valid():
-                map_serializer.save()
-                created_score_sheets.append({
-                    "team_id": teamid,
-                    "judge_id": judge.id,
-                    "scoresheet_id": sheet.id,
-                    "sheetType": 7
-                })
-            else:
-                raise ValidationError(map_serializer.errors)
+    team = get_object_or_404(Teams, id=teamid)
+    team_has_advanced = getattr(team, 'advanced_to_championship', False)
 
-    except Exception as e:
-        raise e
+    judge_ids = MapJudgeToCluster.objects.filter(
+        clusterid=clusterid
+    ).values_list("judgeid", flat=True)
+    judges = Judge.objects.filter(id__in=judge_ids)
+
+    for judge in judges:
+        sheet_specs = []
+        if not team_has_advanced:
+            sheet_specs.extend([
+                (judge.presentation, ScoresheetEnum.PRESENTATION, lambda: create_base_score_sheet(ScoresheetEnum.PRESENTATION)),
+                (judge.journal, ScoresheetEnum.JOURNAL, lambda: create_base_score_sheet(ScoresheetEnum.JOURNAL)),
+                (judge.mdo, ScoresheetEnum.MACHINEDESIGN, lambda: create_base_score_sheet(ScoresheetEnum.MACHINEDESIGN)),
+                (judge.runpenalties, ScoresheetEnum.RUNPENALTIES, create_base_score_sheet_runpenalties),
+                (judge.otherpenalties, ScoresheetEnum.OTHERPENALTIES, create_base_score_sheet_otherpenalties),
+            ])
+        sheet_specs.extend([
+            (judge.redesign, ScoresheetEnum.REDESIGN, create_base_score_sheet_Redesign),
+            (judge.championship, ScoresheetEnum.CHAMPIONSHIP, create_base_score_sheet_Championship),
+        ])
+
+        for enabled, sheet_type, factory in sheet_specs:
+            if not enabled:
+                continue
+            sheet = factory()
+            map_data = {
+                "teamid": teamid,
+                "judgeid": judge.id,
+                "scoresheetid": sheet.id,
+                "sheetType": sheet_type,
+            }
+            map_serializer = MapScoreSheetToTeamJudgeSerializer(data=map_data)
+            if not map_serializer.is_valid():
+                sheet.delete()
+                raise ValidationError(map_serializer.errors)
+            map_serializer.save()
+            created_score_sheets.append({
+                "team_id": teamid,
+                "judge_id": judge.id,
+                "scoresheet_id": sheet.id,
+                "sheetType": sheet_type,
+            })
 
     return created_score_sheets
 
@@ -990,6 +931,11 @@ def make_sheets_for_team(teamid, clusterid):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def get_scoresheet_details_by_team(request, team_id):
+    if not _can_view_team_score_details(request.user, team_id):
+        return Response(
+            {"detail": "You cannot view score details for this team."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     scoresheet_mappings = MapScoresheetToTeamJudge.objects.filter(teamid=team_id)
     scoresheets = Scoresheet.objects.filter(id__in=scoresheet_mappings.values_list('scoresheetid', flat=True))
     presentation_scoresheet_details = [[] for _ in range(9)]
@@ -1254,6 +1200,11 @@ def get_scoresheet_details_for_contest(request):
     except (TypeError, ValueError):
         return Response({"detail": "contestid must be a positive integer"}, status=status.HTTP_400_BAD_REQUEST)
     contest = get_object_or_404(Contest, id=contestid)
+    if not _can_view_contest_scores(request.user, contest.id, judge_id=None):
+        return Response(
+            {"detail": "You cannot view score details for this contest."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     team_mappings = MapContestToTeam.objects.filter(contestid=contest.id)
     
     # Get all clusters for this contest
@@ -1541,7 +1492,7 @@ def create_scoresheets_for_judges_in_cluster(cluster_id):
             cluster = JudgeClusters.objects.get(id=cluster_id)
             cluster_type = getattr(cluster, 'cluster_type', 'preliminary')
         except JudgeClusters.DoesNotExist:
-            cluster_type = 'preliminary'
+            raise ValidationError({"cluster_id": "Cluster not found."})
         
         # Get all judges in this cluster
         judge_mappings = MapJudgeToCluster.objects.filter(clusterid=cluster_id)
@@ -1608,8 +1559,8 @@ def create_scoresheets_for_judges_in_cluster(cluster_id):
                 
             except Judge.DoesNotExist:
                 continue
-            except Exception as e:
-                continue
+            except Exception:
+                raise
         
         return created_scoresheets
         
@@ -1617,26 +1568,30 @@ def create_scoresheets_for_judges_in_cluster(cluster_id):
         raise ValidationError({"detail": str(e)})
     
 @api_view(['GET'])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
 def multi_team_general_penalties(request, judge_id, contest_id):
     """Get all teams assigned to a judge in a contest with their general penalty scoresheets"""
+    if not _can_view_contest_scores(request.user, contest_id, judge_id):
+        return Response(
+            {"detail": "You cannot view scores for this contest and judge."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     try:
         
         # Get clusters assigned to this judge
         judge_clusters = MapJudgeToCluster.objects.filter(
             judgeid=judge_id
         ).values_list('clusterid', flat=True)
-        print(f"DEBUG: judge_clusters={list(judge_clusters)}")
 
         # Get clusters in this contest
         contest_clusters = MapContestToCluster.objects.filter(
             contestid=contest_id
         ).values_list('clusterid', flat=True)
-        print(f"DEBUG: contest_clusters={list(contest_clusters)}")
 
         # Get clusters that are both assigned to this judge AND in this contest
         common_clusters = set(judge_clusters) & set(contest_clusters)
         cluster_ids = list(common_clusters)
-        print(f"DEBUG: common_clusters={cluster_ids}")
         
         team_mappings = MapClusterToTeam.objects.filter(clusterid__in=cluster_ids)
         
@@ -1773,26 +1728,30 @@ def create_missing_championship_scoresheets(request):
 
 
 @api_view(['GET'])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
 def multi_team_run_penalties(request, judge_id, contest_id):
     """Get all teams assigned to a judge in a contest with their run penalty scoresheets"""
+    if not _can_view_contest_scores(request.user, contest_id, judge_id):
+        return Response(
+            {"detail": "You cannot view scores for this contest and judge."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     try:
         
         # Get clusters assigned to this judge
         judge_clusters = MapJudgeToCluster.objects.filter(
             judgeid=judge_id
         ).values_list('clusterid', flat=True)
-        print(f"DEBUG: judge_clusters={list(judge_clusters)}")
 
         # Get clusters in this contest
         contest_clusters = MapContestToCluster.objects.filter(
             contestid=contest_id
         ).values_list('clusterid', flat=True)
-        print(f"DEBUG: contest_clusters={list(contest_clusters)}")
 
         # Get clusters that are both assigned to this judge AND in this contest
         common_clusters = set(judge_clusters) & set(contest_clusters)
         cluster_ids = list(common_clusters)
-        print(f"DEBUG: common_clusters={cluster_ids}")
         
         team_mappings = MapClusterToTeam.objects.filter(clusterid__in=cluster_ids)
         

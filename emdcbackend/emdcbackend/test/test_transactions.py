@@ -60,15 +60,11 @@ class TransactionIntegrityTests(APITestCase):
         response = self.client.post(url, data, format='json')
         
         # Should fail
-        self.assertIn(response.status_code, [
-            status.HTTP_400_BAD_REQUEST,
-            status.HTTP_500_INTERNAL_SERVER_ERROR
-        ])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
         
         # Verify rollback - no partial creation
         self.assertEqual(Judge.objects.count(), initial_judge_count)
-        # User might be created before error, so check is less strict
-        # But judge should not be created
+        self.assertEqual(User.objects.count(), initial_user_count)
     
     def test_create_contest_transaction_atomicity(self):
         """Test that contest creation is atomic"""
@@ -222,10 +218,7 @@ class TransactionIntegrityTests(APITestCase):
         }, format='json')
         
         # Should fail
-        self.assertIn(response.status_code, [
-            status.HTTP_400_BAD_REQUEST,
-            status.HTTP_500_INTERNAL_SERVER_ERROR
-        ])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
         
         # No team should be created
         self.assertEqual(Teams.objects.count(), initial_team_count)
@@ -284,4 +277,3 @@ class DataIntegrityTests(TestCase):
             # Try invalid enum value
             sheet = Scoresheet(sheetType=999)  # Invalid enum value
             sheet.full_clean()
-

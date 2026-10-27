@@ -11,11 +11,14 @@ from rest_framework.response import Response
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from ...serializers import MapVoteToAwardSerializer, MapAwardToContestSerializer
+from ...permissions import is_admin_user
 
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def create_map_vote_to_award(request):
+    if not is_admin_user(request.user):
+        return Response({"detail": "Admin access is required."}, status=status.HTTP_403_FORBIDDEN)
     try:
         serializer = MapVoteToAwardSerializer(data=request.data)
         if serializer.is_valid():
@@ -29,6 +32,8 @@ def create_map_vote_to_award(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def create_map_award_to_contest(request):
+    if not is_admin_user(request.user):
+        return Response({"detail": "Admin access is required."}, status=status.HTTP_403_FORBIDDEN)
     try:
         serializer = MapAwardToContestSerializer(data=request.data)
         if serializer.is_valid():

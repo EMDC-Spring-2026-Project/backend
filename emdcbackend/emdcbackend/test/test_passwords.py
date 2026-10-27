@@ -35,10 +35,8 @@ class PasswordAPITests(APITestCase):
             "username": self.test_user.username
         }
         response = self.client.post(url, data)
-        # Note: This might fail if email backend is not configured, but should return 200 or 500
-        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_500_INTERNAL_SERVER_ERROR])
-        if response.status_code == status.HTTP_200_OK:
-            self.assertEqual(response.data['detail'], "Set-password email sent.")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data['detail'], "Set-password email sent.")
 
     def test_request_password_reset(self):
         """Test public forgot password endpoint"""
@@ -52,10 +50,8 @@ class PasswordAPITests(APITestCase):
             "username": admin_user.username
         }
         response = self.client.post(url, data)
-        # Note: This might fail if email backend is not configured, but should return 200 or 500
-        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_500_INTERNAL_SERVER_ERROR])
-        if response.status_code == status.HTTP_200_OK:
-            self.assertIn('detail', response.data)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertIn('detail', response.data)
 
     def test_password_reset_does_not_reveal_ineligible_accounts(self):
         organizer_user = User.objects.create_user(

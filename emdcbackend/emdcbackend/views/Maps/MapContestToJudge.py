@@ -46,6 +46,8 @@ def create_contest_judge_mapping(request):
 
 
 @api_view(['GET'])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
 def get_all_judges_by_contest_id(request, contest_id):
     # Only count judges that are actually assigned to clusters in this contest
     # This ensures judges removed from clusters are not counted
@@ -63,6 +65,8 @@ def get_all_judges_by_contest_id(request, contest_id):
 
 
 @api_view(['GET'])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
 def get_contest_id_by_judge_id(request, judge_id):
   try:
     # Get all contests for this judge (since judge can be in multiple contests)
