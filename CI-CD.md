@@ -4,11 +4,11 @@ This document describes the CI/CD pipelines configured for the EMDC Backend (Dja
 
 ## Overview
 
-The backend uses **GitHub Actions** for continuous integration and deployment. Three main workflows are configured:
+The backend uses **GitHub Actions** for automated checks and Docker image builds. The deployment workflow contains unconfigured templates; it does not establish where the current public site is hosted:
 
 1. **CI Pipeline** (`ci.yml`) - Runs tests, linting, and security checks
 2. **Docker Build** (`docker.yml`) - Builds and publishes Docker images
-3. **Deployment** (`deploy.yml`) - Deploys to production/staging
+3. **Deployment** (`deploy.yml`) - Manual template that intentionally stops until a hosting provider is configured
 
 ---
 
@@ -20,9 +20,9 @@ The backend uses **GitHub Actions** for continuous integration and deployment. T
 
 ### Jobs
 
-#### 1. **Test** (288 Tests)
+#### 1. **Test**
 - Spins up PostgreSQL 16 container
-- Runs all 288 Django tests with verbosity
+- Runs the Django test suite with verbosity (485 tests passed locally on October 28, 2026)
 - Tests cover:
   - API endpoints
   - Security (SQL injection, XSS)
@@ -49,13 +49,15 @@ black --check --diff emdcbackend/
 isort --check-only --diff emdcbackend/
 ```
 
+These lint/format jobs currently use `continue-on-error`, so they report issues but do not block merges. The test suite, migration check, and dependency vulnerability scan are blocking checks.
+
 #### 3. **Security Scan**
-- **Safety**: Checks for known vulnerabilities in dependencies
+- **pip-audit**: Checks for known vulnerabilities in dependencies (blocking)
 - **Bandit**: Static security analysis for Python code
 - Generates security report artifact (30-day retention)
 
 ```bash
-safety check --json
+pip-audit -r requirements.txt
 bandit -r emdcbackend/ -f json -o bandit-report.json
 ```
 
@@ -100,16 +102,18 @@ ghcr.io/emdc-fall-2025/backend:latest
 ## 🚀 Deployment Pipeline (`deploy.yml`)
 
 ### Triggers
-- Manual dispatch via GitHub UI
-- Optional: Automatic on push to `main` (commented out)
+- Manual dispatch via GitHub UI only
+- This workflow does not deploy automatically when code is pushed.
 
 ### Workflow Steps
 
 #### 1. **Pre-Deployment Tests**
 Runs full test suite before deployment to ensure stability.
 
-#### 2. **Deploy**
-Multiple deployment options included as templates:
+#### 2. **Deployment provider not configured**
+The provider examples below are commented templates. The workflow intentionally stops with an error after tests until the department chooses a host and configures its deployment method and secrets. It does not currently deploy to production or staging.
+
+Available provider examples include:
 
 ##### **Option 1: DigitalOcean App Platform**
 ```yaml
@@ -165,11 +169,11 @@ Multiple deployment options included as templates:
 - `SSH_USERNAME`
 - `SSH_PRIVATE_KEY`
 
-#### 3. **Health Check**
-Post-deployment verification:
+#### 3. **Health Check template**
+After a real provider is configured, post-deployment verification should:
 - Waits 30 seconds for service startup
 - Calls `/api/health/` endpoint
-- Fails deployment if unhealthy
+- Fail the workflow if the service is unhealthy
 
 ---
 
@@ -198,8 +202,8 @@ Configure these secrets in your GitHub repository settings:
 - **AWS**: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
 - **SSH/VPS**: `SSH_HOST`, `SSH_USERNAME`, `SSH_PRIVATE_KEY`, `SSH_PORT`
 
-#### Health Check
-- `API_URL` - Deployed API URL (e.g., `https://api.emdc.com`)
+#### Health Check (after hosting is selected)
+- `API_URL` - Deployed API URL (e.g., `https://api.example.edu`)
 
 ---
 
@@ -209,9 +213,7 @@ Configure these secrets in your GitHub repository settings:
 GitHub Actions is automatically enabled for this repository.
 
 ### 2. Configure Secrets
-1. Go to **Settings → Secrets and variables → Actions**
-2. Click **New repository secret**
-3. Add required secrets based on your deployment target
+Add deployment secrets only after the department selects a hosting provider. The names above apply to the commented provider templates; the current workflow does not use them to deploy.
 
 ### 3. Set Up Database
 Ensure PostgreSQL 12+ is available in your deployment environment:
@@ -222,14 +224,14 @@ Ensure PostgreSQL 12+ is available in your deployment environment:
 createdb emdc_production
 ```
 
-### 4. Configure Environments (Recommended)
+### 4. Configure Environments (after choosing a provider)
 1. Go to **Settings → Environments**
 2. Create `production` and `staging` environments
 3. Add environment-specific secrets and protection rules
 
-### 5. Enable Workflows
+### 5. View Workflows
 - View workflow runs in **Actions** tab
-- Manually trigger deployment: **Actions → Deploy Backend → Run workflow**
+- The deployment workflow is a placeholder and intentionally fails after tests until a provider is configured. Do not treat it as a working deployment path.
 
 ---
 
@@ -262,6 +264,8 @@ Production settings in `emdcbackend/settings.py`:
 - `ALLOWED_HOSTS` configured via environment
 - `SESSION_COOKIE_SECURE = True` (HTTPS)
 - `CSRF_COOKIE_SECURE = True` (HTTPS)
+- `SECURE_SSL_REDIRECT = True` by default when `DEBUG=0`; set `TRUST_X_FORWARDED_PROTO=1` only if the trusted hosting proxy overwrites `X-Forwarded-Proto` with the original HTTPS protocol.
+- Set `SECURE_HSTS_SECONDS` only after confirming HTTPS works on every hostname you intend to protect. For example, use `31536000` for one year after the HTTPS setup has been verified. `SECURE_HSTS_INCLUDE_SUBDOMAINS` and `SECURE_HSTS_PRELOAD` are off by default and should be enabled only after confirming every affected subdomain is ready.
 
 ---
 
@@ -403,7 +407,7 @@ python manage.py makemigrations --check
 ## 📚 Additional Resources
 
 - [GitHub Actions Documentation](https://docs.github.com/en/actions)
-- [Django Deployment Checklist](https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/)
+- [Django Deployment Checklist](https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/)
 - [PostgreSQL Documentation](https://www.postgresql.org/docs/)
 - [Docker Best Practices](https://docs.docker.com/develop/dev-best-practices/)
 

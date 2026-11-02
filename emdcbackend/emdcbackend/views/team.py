@@ -272,9 +272,12 @@ def create_team(request):
     except ValidationError as e:
         # Specific error handling for validation errors
         return Response({"errors": e.detail}, status=status.HTTP_400_BAD_REQUEST)
-    except Exception as e:
-        # General error handling
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while creating team")
+        return Response(
+            {"detail": "Unable to create the team due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
@@ -334,8 +337,12 @@ def edit_team(request):
                         # EXISTING COACH - Just reassign to this team, NO email sent
                         # This coach already exists and has their password, so don't send another email
                         existing_coach = Coach.objects.get(id=role_mapping_response.get("relatedid"))
-                        existing_coach.first_name = request.data["first_name"]
-                        existing_coach.last_name = request.data.get("last_name", "") or ""
+                        existing_coach.first_name = request.data.get(
+                            "first_name", existing_coach.first_name
+                        )
+                        existing_coach.last_name = request.data.get(
+                            "last_name", existing_coach.last_name
+                        )
                         existing_coach.save()
                         coach = existing_coach  # Update local coach variable
                         coach_response = get_coach(existing_coach.id)
@@ -439,8 +446,12 @@ def edit_team(request):
         return Response({"error": "Team or coach record not found."}, status=status.HTTP_404_NOT_FOUND)
     except ValidationError as e:
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-    except Exception as e:
-        return Response({"error": "An error occurred: " + str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while editing team %s", request.data.get("id"))
+        return Response(
+            {"detail": "Unable to update the team due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
     return Response({"Team": serializer.data, "ScoreSheets": score_sheets_data, "Coach": coach_data}, status=status.HTTP_200_OK)
 
@@ -525,10 +536,10 @@ def delete_team_by_id(request, team_id):
             {"detail": "Team and all related mappings deleted successfully."},
             status=status.HTTP_200_OK,
         )
-    except Exception as e:
-        # Return exact error to aid debugging of any remaining FK blockers
+    except Exception:
+        logger.exception("Unexpected error while deleting team %s", team_id)
         return Response(
-            {"detail": f"{type(e).__name__}: {str(e)}"},
+            {"detail": "Unable to delete the team due to an unexpected server error."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
@@ -672,8 +683,12 @@ def create_team_after_judge(request):
   except ValidationError as e:  # Catching ValidationErrors specifically
     return Response({"errors": e.detail}, status=status.HTTP_400_BAD_REQUEST)
   
-  except Exception as e:
-    return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+  except Exception:
+    logger.exception("Unexpected error while creating team after judge setup")
+    return Response(
+      {"detail": "Unable to create the team due to an unexpected server error."},
+      status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    )
 
 @api_view(["GET"])
 @authentication_classes([SessionAuthentication])
@@ -692,5 +707,9 @@ def get_all_teams(request):
         serializer = TeamSerializer(teams, many=True)
         return Response({"teams": serializer.data}, status=status.HTTP_200_OK)
 
-    except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while listing teams")
+        return Response(
+            {"detail": "Unable to load teams due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )

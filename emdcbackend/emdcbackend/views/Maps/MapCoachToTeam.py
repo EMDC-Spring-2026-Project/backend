@@ -64,34 +64,42 @@ def teams_by_coach_id(request, coach_id):
     mappings = MapCoachToTeam.objects.filter(coachid=coach_id)
     team_ids = mappings.values_list('teamid', flat=True)
     teams = Teams.objects.filter(id__in=team_ids).order_by('-id')
-    
-    # Get contests for these teams and check if results should be hidden
-    team_contest_map = {}
-    for team in teams:
-        contest_mapping = MapContestToTeam.objects.filter(teamid=team.id).first()
-        if contest_mapping:
-            team_contest_map[team.id] = contest_mapping.contestid
+
+    # A team may be linked to multiple contests. Since its score fields are
+    # shared, hide them until every linked contest has finished and tabulated.
+    team_contest_ids = {}
+    for team_id, contest_id in MapContestToTeam.objects.filter(
+        teamid__in=team_ids
+    ).values_list("teamid", "contestid"):
+        team_contest_ids.setdefault(team_id, set()).add(contest_id)
+    contest_ids = {
+        contest_id
+        for linked_contests in team_contest_ids.values()
+        for contest_id in linked_contests
+    }
+    contests_by_id = Contest.objects.in_bulk(contest_ids)
     
     team_data = []
     for team in teams:
         team_dict = TeamSerializer(instance=team).data
-        contest_id = team_contest_map.get(team.id)
-        if contest_id:
-            try:
-                contest = Contest.objects.get(id=contest_id)
-                # Hide scores if contest is open or not tabulated
-                if getattr(contest, 'is_open', False) or not getattr(contest, 'is_tabulated', False):
-                    # Clear all score fields
-                    team_dict['journal_score'] = 0
-                    team_dict['presentation_score'] = 0
-                    team_dict['machinedesign_score'] = 0
-                    team_dict['penalties_score'] = 0
-                    team_dict['redesign_score'] = 0
-                    team_dict['championship_score'] = 0
-                    team_dict['total_score'] = 0
-                    team_dict['team_rank'] = None
-            except Contest.DoesNotExist:
-                pass
+        linked_contests = (
+            contests_by_id[contest_id]
+            for contest_id in team_contest_ids.get(team.id, set())
+            if contest_id in contests_by_id
+        )
+        if any(
+            not contest.results_published
+            for contest in linked_contests
+        ):
+            # Clear all score fields until no linked contest is still active.
+            team_dict['journal_score'] = 0
+            team_dict['presentation_score'] = 0
+            team_dict['machinedesign_score'] = 0
+            team_dict['penalties_score'] = 0
+            team_dict['redesign_score'] = 0
+            team_dict['championship_score'] = 0
+            team_dict['total_score'] = 0
+            team_dict['team_rank'] = None
         team_data.append(team_dict)
     
     return Response({"Teams": team_data}, status=status.HTTP_200_OK)
@@ -115,6 +123,23 @@ def coach_by_team_id(request, team_id):
 @permission_classes([AllowAny])
 def coaches_by_teams(request):
     teams = request.data  # Expecting a list of team data objects
+    if not isinstance(teams, list) or not all(
+        isinstance(team, dict)
+        and isinstance(team.get("id"), int)
+        and not isinstance(team.get("id"), bool)
+        and team["id"] > 0
+        for team in teams
+    ):
+        return Response(
+            {"detail": "Provide a list of teams with positive integer IDs."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if len(teams) > 100:
+        return Response(
+            {"detail": "Request at most 100 teams at a time."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     response_data = {}
 
     for team in teams:
@@ -129,12 +154,16 @@ def coaches_by_teams(request):
             user = get_object_or_404(User, id=uuid)
 
             # Add to response dictionary with team ID as key
-            response_data[team_id] = {
+            coach_data = {
                 "id": coach.id,
                 "first_name": coach.first_name,
                 "last_name": coach.last_name,
-                "username": user.username
             }
+            # Public contest results show coach names, but coach login emails
+            # should only be visible to staff who manage this team's contests.
+            if request.user.is_authenticated and _can_manage_team(request.user, team_id):
+                coach_data["username"] = user.username
+            response_data[team_id] = coach_data
 
         except MapCoachToTeam.DoesNotExist:
             response_data[team_id] = {"error": "No coach assigned to this team"}

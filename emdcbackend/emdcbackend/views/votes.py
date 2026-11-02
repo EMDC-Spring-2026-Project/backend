@@ -1,3 +1,5 @@
+import logging
+
 from django.core.exceptions import FieldError
 from django.shortcuts import get_object_or_404
 from rest_framework import status
@@ -14,6 +16,8 @@ from ..models import Votes
 from ..serializers import VotesSerializer
 from ..permissions import is_admin_user
 
+logger = logging.getLogger(__name__)
+
 # Votes Views
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
@@ -27,8 +31,12 @@ def create_vote(request):
             serializer.save()
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while creating vote")
+        return Response(
+            {"error": "Unable to create vote due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 @api_view(["GET"])
 @authentication_classes([SessionAuthentication])
@@ -40,5 +48,9 @@ def get_all_votes(request):
         votes = Votes.objects.all()
         serializer = VotesSerializer(votes, many=True)
         return Response({"votes": serializer.data}, status=status.HTTP_200_OK)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading votes")
+        return Response(
+            {"error": "Unable to load votes due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )

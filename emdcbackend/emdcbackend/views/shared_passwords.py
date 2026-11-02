@@ -4,7 +4,8 @@ from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth.hashers import make_password
 from django.db import transaction
-from ..models import RoleSharedPassword, MapUserToRole
+from ..models import RoleSharedPassword
+from ..permissions import is_admin_user
 
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
@@ -18,13 +19,8 @@ def set_shared_password(request):
         "password": "new-shared-pass"
       }
     """
-    # Check if user is an admin (role = 1)
-    try:
-        user_role_mapping = MapUserToRole.objects.get(uuid=request.user.id)
-        if user_role_mapping.role != 1:  # 1 = ADMIN
-            return Response({"error": "Only admins can set shared passwords."}, status=403)
-    except MapUserToRole.DoesNotExist:
-        return Response({"error": "User role not found."}, status=403)
+    if not is_admin_user(request.user):
+        return Response({"error": "Only admins can set shared passwords."}, status=403)
     
     role = request.data.get("role")
     password = request.data.get("password")

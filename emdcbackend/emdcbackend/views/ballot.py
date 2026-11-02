@@ -1,3 +1,5 @@
+import logging
+
 from django.core.exceptions import FieldError
 from django.shortcuts import get_object_or_404
 from rest_framework import status
@@ -14,6 +16,8 @@ from ..models import Ballot
 from ..serializers import BallotSerializer
 from ..permissions import is_admin_user
 
+logger = logging.getLogger(__name__)
+
 # Ballot Views
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
@@ -27,8 +31,12 @@ def create_ballot(request):
             serializer.save()
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while creating ballot")
+        return Response(
+            {"error": "Unable to create ballot due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 @api_view(["GET"])
 @authentication_classes([SessionAuthentication])
@@ -40,8 +48,12 @@ def get_all_ballots(request):
         ballots = Ballot.objects.all()
         serializer = BallotSerializer(ballots, many=True)
         return Response({"ballots": serializer.data}, status=status.HTTP_200_OK)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading ballots")
+        return Response(
+            {"error": "Unable to load ballots due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 @api_view(["DELETE"])
 @authentication_classes([SessionAuthentication])
@@ -55,5 +67,9 @@ def delete_ballot(request, ballot_id):
         return Response(status=status.HTTP_204_NO_CONTENT)
     except Ballot.DoesNotExist:
         return Response({"error": "Ballot not found"}, status=status.HTTP_404_NOT_FOUND)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while deleting ballot %s", ballot_id)
+        return Response(
+            {"error": "Unable to delete ballot due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )

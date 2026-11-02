@@ -1,4 +1,7 @@
-# backend/emdcbackend/emdcbackend/auth/views.py
+"""Session authentication and account-management API views."""
+
+import logging
+
 from django.contrib.auth.models import User
 from django.db import transaction
 from django.shortcuts import get_object_or_404
@@ -32,6 +35,8 @@ from .password_utils import send_set_password_email
 
 # If you use role lookups elsewhere, keep your import the same:
 from ..views.Maps.MapUserToRole import get_role
+
+logger = logging.getLogger(__name__)
 
 
 def _send_set_password_email_after_commit(user_id):
@@ -201,8 +206,12 @@ def signup(request):
         return Response(result, status=status.HTTP_201_CREATED)
     except ValidationError as e:
         return Response({"errors": e.detail}, status=status.HTTP_400_BAD_REQUEST)
-    except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while creating user account")
+        return Response(
+            {"detail": "Unable to create the account due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 @api_view(["DELETE"])

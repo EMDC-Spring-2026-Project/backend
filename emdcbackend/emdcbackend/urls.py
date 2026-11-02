@@ -20,7 +20,8 @@ from .views.organizer import create_organizer, organizer_by_id, edit_organizer, 
     organizer_disqualify_team, get_all_organizers
 
 from .views.coach import create_coach, coach_by_id, edit_coach, delete_coach, coach_get_all
-from .views.contest import contest_by_id, contest_get_all, create_contest, edit_contest, delete_contest
+from .views.health import api_health
+from .views.contest import contest_by_id, contest_get_all, create_contest, edit_contest, delete_contest, publish_contest_results
 from .views.team import (
     create_team, team_by_id, edit_team, delete_team_by_id, get_teams_by_team_rank,
     create_team_after_judge, is_team_disqualified, get_all_teams
@@ -30,7 +31,7 @@ from .views.Maps.MapCoachToTeam import (
     teams_by_coach_id, coaches_by_teams
 )
 from .views.clusters import cluster_by_id, create_cluster, clusters_get_all, delete_cluster, edit_cluster
-from .views.Maps.MapContestToJudge import create_contest_judge_mapping, get_all_judges_by_contest_id, get_contest_id_by_judge_id, delete_contest_judge_mapping_by_id
+from .views.Maps.MapContestToJudge import create_contest_judge_mapping, get_all_judges_by_contest_id, get_public_judge_count_by_contest_id, get_contest_id_by_judge_id, delete_contest_judge_mapping_by_id
 from .views.Maps.AssignJudgeToContest import assign_judge_to_contest, get_judge_contests, remove_judge_from_contest, remove_judge_from_cluster
 from .views.Maps.MapContestToOrganizer import create_contest_organizer_mapping, get_organizers_by_contest_id, get_contests_by_organizer_id, delete_contest_organizer_mapping, \
     get_all_contests_by_organizer, get_organizer_names_by_contests
@@ -60,6 +61,7 @@ from .auth.views import login_view, logout_view, csrf_view
 from .views.shared_passwords import set_shared_password
 
 urlpatterns = [
+    path('api/health/', api_health, name='api_health'),
     # Admins
     path('api/admin/get/<int:admin_id>/', admin_by_id, name='admin_by_id'),
     path('api/admin/getAll/', admins_get_all, name='admins_get_all'),
@@ -152,6 +154,7 @@ urlpatterns = [
     path('api/mapping/organizerToContest/getOrganizersByContest/<int:contest_id>/', get_organizers_by_contest_id, name='get_organizers_by_contest_id'),
 
     path('api/mapping/judgeToContest/getAllJudges/<int:contest_id>/', get_all_judges_by_contest_id, name='get_all_judges_by_contest_id'),
+    path('api/mapping/judgeToContest/getPublicJudgeCount/<int:contest_id>/', get_public_judge_count_by_contest_id, name='get_public_judge_count_by_contest_id'),
     path('api/mapping/teamToContest/getTeamsByContest/<int:contest_id>/', get_teams_by_contest_id, name='get_teams_by_contest_id'),
 
     path('api/mapping/userToRole/create/', create_user_role_mapping, name='create_user_role_mapping'),
@@ -194,6 +197,7 @@ urlpatterns = [
     path('api/contest/getAll/', contest_get_all, name='contest_get_all'),
     path('api/contest/create/', create_contest, name='create_contest'),
     path('api/contest/edit/', edit_contest, name='edit_contest'),
+    path('api/contest/<int:contest_id>/publish-results/', publish_contest_results, name='publish_contest_results'),
     path('api/contest/delete/<int:contest_id>/', delete_contest, name='delete_contest'),
 
     # ScoreSheets

@@ -7,6 +7,7 @@ from django.utils.http import urlsafe_base64_encode
 from django.utils.encoding import force_bytes
 from django.core.exceptions import ValidationError
 from django.contrib.auth.password_validation import validate_password
+from django.core.cache import cache
 from ..models import RoleSharedPassword, Admin, Organizer, MapUserToRole
 from ..auth.password_validators import (
     UppercasePasswordValidator,
@@ -53,6 +54,23 @@ class PasswordAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertIn('detail', response.data)
 
+    def test_password_reset_requests_are_rate_limited(self):
+        url = reverse("request_password_reset")
+        cache.clear()
+        try:
+            for _ in range(10):
+                response = self.client.post(url, {"username": "missing@example.com"})
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+            throttled_response = self.client.post(
+                url, {"username": "missing@example.com"}
+            )
+            self.assertEqual(
+                throttled_response.status_code, status.HTTP_429_TOO_MANY_REQUESTS
+            )
+        finally:
+            cache.clear()
+
     def test_password_reset_does_not_reveal_ineligible_accounts(self):
         organizer_user = User.objects.create_user(
             username="organizer-reset@example.com", password="OrganizerPass123!"
@@ -69,6 +87,29 @@ class PasswordAPITests(APITestCase):
         self.assertEqual(existing_response.status_code, status.HTTP_200_OK)
         self.assertEqual(missing_response.status_code, status.HTTP_200_OK)
         self.assertEqual(existing_response.data, missing_response.data)
+
+    def test_password_reset_email_failure_does_not_reveal_eligible_account(self):
+        from unittest.mock import patch
+
+        url = reverse("request_password_reset")
+        cache.clear()
+        try:
+            with patch(
+                "emdcbackend.auth.password_views.send_email_via_resend",
+                side_effect=RuntimeError("provider secret detail"),
+            ):
+                eligible_response = self.client.post(
+                    url, {"username": self.user.username}
+                )
+            missing_response = self.client.post(
+                url, {"username": "missing-provider@example.com"}
+            )
+
+            self.assertEqual(eligible_response.status_code, status.HTTP_200_OK)
+            self.assertEqual(eligible_response.data, missing_response.data)
+            self.assertNotIn("provider secret detail", str(eligible_response.data))
+        finally:
+            cache.clear()
 
     def test_validate_password_token(self):
         """Test validating password reset token"""
@@ -357,6 +398,22 @@ class PasswordValidationTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(response.data.get('success', False))
         self.assertTrue(RoleSharedPassword.objects.filter(role=2).exists())
+
+    def test_superuser_can_set_shared_password(self):
+        superuser = User.objects.create_superuser(
+            username="root@example.com",
+            email="root@example.com",
+            password="RootPass123!",
+        )
+        self.client.force_authenticate(user=superuser)
+
+        response = self.client.post(reverse("set_shared_password"), {
+            "role": 2,
+            "password": "SharedPass123!",
+        })
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data.get("success", False))
     
     def test_django_validate_password_integration(self):
         """Test that Django's validate_password uses our custom validators"""

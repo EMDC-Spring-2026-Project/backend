@@ -75,6 +75,28 @@ class MappingAPITests(APITestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+    def test_coach_scores_stay_hidden_if_any_linked_contest_is_unfinished(self):
+        completed_contest = Contest.objects.create(
+            name="Completed Shared-Team Contest", date=date.today(),
+            is_open=False, is_tabulated=True,
+        )
+        MapContestToTeam.objects.create(
+            contestid=completed_contest.id, teamid=self.team.id
+        )
+        MapContestToTeam.objects.create(
+            contestid=self.contest.id, teamid=self.team.id
+        )
+        MapCoachToTeam.objects.create(teamid=self.team.id, coachid=self.coach.id)
+
+        response = self.client.get(
+            reverse('teams_by_coach_id', args=[self.coach.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        team = next(row for row in response.data['Teams'] if row['id'] == self.team.id)
+        self.assertEqual(team['total_score'], 0)
+        self.assertIsNone(team['team_rank'])
+
     # ContestToJudge Mapping Tests
     def test_create_contest_judge_mapping(self):
         url = reverse('create_contest_judge_mapping')
@@ -91,6 +113,75 @@ class MappingAPITests(APITestCase):
         url = reverse('get_all_judges_by_contest_id', args=[self.contest.id])
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_public_judge_count_is_available_without_auth_and_exposes_no_judge_data(self):
+        MapContestToCluster.objects.create(
+            contestid=self.contest.id, clusterid=self.cluster.id
+        )
+        MapJudgeToCluster.objects.create(
+            judgeid=self.judge.id,
+            clusterid=self.cluster.id,
+            contestid=self.contest.id,
+        )
+        self.client.logout()
+
+        response = self.client.get(
+            reverse("get_public_judge_count_by_contest_id", args=[self.contest.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {"judge_count": 1})
+        self.assertNotIn("Judges", response.data)
+        self.assertNotIn("phone_number", response.data)
+
+    def test_public_judge_count_returns_not_found_for_unknown_contest(self):
+        response = self.client.get(
+            reverse("get_public_judge_count_by_contest_id", args=[999999])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_full_judge_list_still_requires_authentication(self):
+        self.client.logout()
+
+        response = self.client.get(
+            reverse("get_all_judges_by_contest_id", args=[self.contest.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_get_all_judges_by_contest_id_excludes_other_contest_assignments_on_shared_cluster(self):
+        from datetime import date
+
+        other_contest = Contest.objects.create(
+            name="Other Judge List Contest", date=date.today(), is_open=True,
+            is_tabulated=False,
+        )
+        other_judge = Judge.objects.create(
+            first_name="Other", last_name="Contest Judge", phone_number="5555555555",
+            contestid=other_contest.id,
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.contest.id, clusterid=self.cluster.id
+        )
+        MapContestToCluster.objects.create(
+            contestid=other_contest.id, clusterid=self.cluster.id
+        )
+        MapJudgeToCluster.objects.create(
+            judgeid=self.judge.id, clusterid=self.cluster.id, contestid=self.contest.id
+        )
+        MapJudgeToCluster.objects.create(
+            judgeid=other_judge.id, clusterid=self.cluster.id, contestid=other_contest.id
+        )
+
+        response = self.client.get(
+            reverse('get_all_judges_by_contest_id', args=[self.contest.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        judge_ids = {judge['id'] for judge in response.data['Judges']}
+        self.assertIn(self.judge.id, judge_ids)
+        self.assertNotIn(other_judge.id, judge_ids)
 
     def test_get_contest_id_by_judge_id(self):
         MapContestToJudge.objects.create(contestid=self.contest.id, judgeid=self.judge.id)
@@ -111,15 +202,91 @@ class MappingAPITests(APITestCase):
 
     def test_get_teams_by_contest_id(self):
         MapContestToTeam.objects.create(contestid=self.contest.id, teamid=self.team.id)
+        self.team.total_score = 278.5
+        self.team.preliminary_total_score = 278.5
+        self.team.advanced_to_championship = True
+        self.team.save()
+        self.client.logout()
         url = reverse('get_teams_by_contest_id', args=[self.contest.id])
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data[0]["total_score"], 0)
+        self.assertEqual(response.data[0]["preliminary_total_score"], 0)
+        self.assertIsNone(response.data[0]["team_rank"])
+        self.assertFalse(response.data[0]["advanced_to_championship"])
+
+    def test_get_teams_by_missing_contest_returns_not_found(self):
+        response = self.client.get(reverse('get_teams_by_contest_id', args=[999999]))
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_closed_results_stay_hidden_until_organizer_publishes(self):
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=self.team.id)
+        self.contest.is_open = False
+        self.contest.is_tabulated = True
+        self.contest.results_published = False
+        self.contest.save()
+        self.team.total_score = 278.5
+        self.team.save()
+
+        response = self.client.get(
+            reverse('get_teams_by_contest_id', args=[self.contest.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data[0]["total_score"], 0)
+        self.assertIsNone(response.data[0]["team_rank"])
+
+    @patch('emdcbackend.views.tabulation.recompute_totals_and_ranks')
+    def test_get_teams_by_contest_returns_stored_results_only_after_publication(self, recompute):
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=self.team.id)
+        self.contest.is_open = False
+        self.contest.is_tabulated = True
+        self.contest.results_published = True
+        self.contest.save()
+        self.team.total_score = 278.5
+        self.team.preliminary_total_score = 278.5
+        self.team.advanced_to_championship = True
+        self.team.save()
+
+        response = self.client.get(
+            reverse('get_teams_by_contest_id', args=[self.contest.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        recompute.assert_not_called()
+        self.assertEqual(response.data[0]["total_score"], 278.5)
+        self.assertEqual(response.data[0]["preliminary_total_score"], 278.5)
+        self.assertTrue(response.data[0]["advanced_to_championship"])
 
     def test_get_contest_id_by_team_id(self):
         MapContestToTeam.objects.create(contestid=self.contest.id, teamid=self.team.id)
         url = reverse('get_contest_id_by_team_id', args=[self.team.id])
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["Contest"]["id"], self.contest.id)
+        self.assertEqual([contest["id"] for contest in response.data["Contests"]], [self.contest.id])
+
+    def test_get_contests_by_team_id_handles_shared_teams(self):
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=self.team.id)
+        other_contest = Contest.objects.create(
+            name="Second Shared Contest", date=date.today(), is_open=True,
+            is_tabulated=False,
+        )
+        MapContestToTeam.objects.create(
+            contestid=other_contest.id, teamid=self.team.id
+        )
+
+        response = self.client.get(
+            reverse("get_contest_id_by_team_id", args=[self.team.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["Contest"]["id"], self.contest.id)
+        self.assertEqual(
+            [contest["id"] for contest in response.data["Contests"]],
+            sorted([self.contest.id, other_contest.id]),
+        )
 
     # ContestToOrganizer Mapping Tests
     def test_create_contest_organizer_mapping(self):
@@ -281,6 +448,61 @@ class MappingAPITests(APITestCase):
         self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_201_CREATED])
         self.assertTrue(MapJudgeToCluster.objects.filter(judgeid=self.judge.id, clusterid=self.cluster.id).exists())
 
+    def test_create_cluster_judge_mapping_hides_unexpected_errors(self):
+        with self.assertLogs(
+            "emdcbackend.views.Maps.MapClusterToJudge", level="ERROR"
+        ):
+            with patch(
+                "emdcbackend.views.Maps.MapClusterToJudge.map_cluster_to_judge",
+                side_effect=RuntimeError("sensitive database detail"),
+            ):
+                response = self.client.post(
+                    reverse("create_cluster_judge_mapping"),
+                    {"clusterid": self.cluster.id, "judgeid": self.judge.id},
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("sensitive database detail", str(response.data))
+
+    def test_create_cluster_judge_mapping_requires_contest_for_shared_cluster(self):
+        from datetime import date
+
+        other_contest = Contest.objects.create(
+            name="Other Contest", date=date.today(), is_open=True, is_tabulated=False
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.contest.id, clusterid=self.cluster.id
+        )
+        MapContestToCluster.objects.create(
+            contestid=other_contest.id, clusterid=self.cluster.id
+        )
+        url = reverse("create_cluster_judge_mapping")
+        payload = {"judgeid": self.judge.id, "clusterid": self.cluster.id}
+
+        ambiguous_response = self.client.post(url, payload, format="json")
+        self.assertEqual(
+            ambiguous_response.status_code, status.HTTP_400_BAD_REQUEST,
+            ambiguous_response.data,
+        )
+        self.assertFalse(
+            MapJudgeToCluster.objects.filter(
+                judgeid=self.judge.id, clusterid=self.cluster.id
+            ).exists()
+        )
+
+        payload["contestid"] = self.contest.id
+        explicit_response = self.client.post(url, payload, format="json")
+        self.assertEqual(
+            explicit_response.status_code, status.HTTP_201_CREATED,
+            explicit_response.data,
+        )
+        self.assertEqual(
+            MapJudgeToCluster.objects.get(
+                judgeid=self.judge.id, clusterid=self.cluster.id
+            ).contestid,
+            self.contest.id,
+        )
+
     def test_judges_by_cluster_id(self):
         MapJudgeToCluster.objects.create(judgeid=self.judge.id, clusterid=self.cluster.id)
         url = reverse('judges_by_cluster', args=[self.cluster.id])
@@ -298,6 +520,67 @@ class MappingAPITests(APITestCase):
         url = reverse('all_clusters_by_judge', args=[self.judge.id])
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_all_clusters_by_judge_uses_assignment_contest_for_shared_cluster(self):
+        other_contest = Contest.objects.create(
+            name="Other Cluster Contest", date=date.today(), is_open=True,
+            is_tabulated=False,
+        )
+        # Put the unrelated contest first to ensure the endpoint doesn't guess
+        # based on whichever cluster mapping happens to be returned first.
+        MapContestToCluster.objects.create(
+            contestid=other_contest.id, clusterid=self.cluster.id
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.contest.id, clusterid=self.cluster.id
+        )
+        MapJudgeToCluster.objects.create(
+            judgeid=self.judge.id, clusterid=self.cluster.id,
+            contestid=self.contest.id,
+        )
+
+        response = self.client.get(
+            reverse('all_clusters_by_judge', args=[self.judge.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['Clusters']), 1)
+        self.assertEqual(response.data['Clusters'][0]['contest_id'], self.contest.id)
+
+    def test_all_clusters_by_judge_hides_ambiguous_legacy_assignment(self):
+        other_contest = Contest.objects.create(
+            name="Other Legacy Cluster Contest", date=date.today(), is_open=True,
+            is_tabulated=False,
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.contest.id, clusterid=self.cluster.id
+        )
+        MapContestToCluster.objects.create(
+            contestid=other_contest.id, clusterid=self.cluster.id
+        )
+        MapJudgeToCluster.objects.create(
+            judgeid=self.judge.id, clusterid=self.cluster.id
+        )
+
+        response = self.client.get(
+            reverse('all_clusters_by_judge', args=[self.judge.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['Clusters'], [])
+
+    def test_all_clusters_by_judge_hides_stale_contest_assignment(self):
+        MapJudgeToCluster.objects.create(
+            judgeid=self.judge.id, clusterid=self.cluster.id,
+            contestid=self.contest.id,
+        )
+
+        response = self.client.get(
+            reverse('all_clusters_by_judge', args=[self.judge.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['Clusters'], [])
 
     # ClusterToContest Mapping Tests
     def test_all_clusters_by_contest_id(self):
@@ -335,6 +618,21 @@ class MappingAPITests(APITestCase):
             judgeid=self.judge.id,
             scoresheetid=scoresheet.id
         ).exists())
+
+    @patch(
+        "emdcbackend.views.Maps.MapScoreSheet.map_score_sheet",
+        side_effect=RuntimeError("private database detail"),
+    )
+    def test_create_score_sheet_mapping_hides_internal_errors(self, _mock_map):
+        response = self.client.post(
+            reverse("create_score_sheet_mapping"),
+            {"teamid": self.team.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("private database detail", str(response.data))
+        self.assertIn("Unable to create", response.data["detail"])
 
     def test_unprivileged_user_cannot_create_score_sheet_mapping(self):
         scoresheet = Scoresheet.objects.create(
@@ -616,6 +914,92 @@ class MappingAPITests(APITestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+    def test_get_user_by_role_blocks_unrelated_authenticated_users(self):
+        unprivileged_user = User.objects.create_user(
+            username="unrelated@example.com", password="testpassword"
+        )
+        MapUserToRole.objects.create(
+            uuid=unprivileged_user.id,
+            role=MapUserToRole.RoleEnum.COACH,
+            relatedid=self.coach.id,
+        )
+        self.client.force_authenticate(user=unprivileged_user)
+
+        response = self.client.get(
+            reverse("get_user_by_role", args=[self.admin.id, MapUserToRole.RoleEnum.ADMIN])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_organizer_can_view_assigned_judge_account(self):
+        organizer_user = User.objects.create_user(
+            username="organizer@example.com", password="testpassword"
+        )
+        MapUserToRole.objects.create(
+            uuid=organizer_user.id,
+            role=MapUserToRole.RoleEnum.ORGANIZER,
+            relatedid=self.organizer.id,
+        )
+        MapContestToOrganizer.objects.create(
+            contestid=self.contest.id, organizerid=self.organizer.id
+        )
+        MapContestToJudge.objects.create(
+            contestid=self.contest.id, judgeid=self.judge.id
+        )
+        judge_user = User.objects.create_user(
+            username="judge@example.com", password="testpassword"
+        )
+        MapUserToRole.objects.create(
+            uuid=judge_user.id,
+            role=MapUserToRole.RoleEnum.JUDGE,
+            relatedid=self.judge.id,
+        )
+        self.client.force_authenticate(user=organizer_user)
+
+        response = self.client.get(
+            reverse(
+                "get_user_by_role",
+                args=[self.judge.id, MapUserToRole.RoleEnum.JUDGE],
+            )
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["User"]["username"], "judge@example.com")
+
+    def test_organizer_cannot_view_shared_judge_account_without_all_contests(self):
+        from datetime import date
+
+        other_contest = Contest.objects.create(
+            name="Other Contest", date=date.today(), is_open=True, is_tabulated=False
+        )
+        organizer_user = User.objects.create_user(
+            username="organizer@example.com", password="testpassword"
+        )
+        MapUserToRole.objects.create(
+            uuid=organizer_user.id,
+            role=MapUserToRole.RoleEnum.ORGANIZER,
+            relatedid=self.organizer.id,
+        )
+        MapContestToOrganizer.objects.create(
+            contestid=self.contest.id, organizerid=self.organizer.id
+        )
+        MapContestToJudge.objects.create(
+            contestid=self.contest.id, judgeid=self.judge.id
+        )
+        MapContestToJudge.objects.create(
+            contestid=other_contest.id, judgeid=self.judge.id
+        )
+        self.client.force_authenticate(user=organizer_user)
+
+        response = self.client.get(
+            reverse(
+                "get_user_by_role",
+                args=[self.judge.id, MapUserToRole.RoleEnum.JUDGE],
+            )
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
     # Additional mapping tests
     def test_assign_judge_to_contest(self):
         """Test assigning a judge to a contest"""
@@ -629,6 +1013,45 @@ class MappingAPITests(APITestCase):
         }
         response = self.client.post(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_assign_judge_does_not_overwrite_assignment_for_shared_cluster(self):
+        other_contest = Contest.objects.create(
+            name="Existing Judge Assignment Contest", date=date.today(), is_open=True,
+            is_tabulated=False,
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.contest.id, clusterid=self.cluster.id
+        )
+        MapContestToCluster.objects.create(
+            contestid=other_contest.id, clusterid=self.cluster.id
+        )
+        MapContestToJudge.objects.create(
+            contestid=other_contest.id, judgeid=self.judge.id
+        )
+        existing_assignment = MapJudgeToCluster.objects.create(
+            judgeid=self.judge.id, clusterid=self.cluster.id,
+            contestid=other_contest.id, presentation=True,
+        )
+
+        response = self.client.post(
+            reverse('assign_judge_to_contest'),
+            {
+                "judge_id": self.judge.id,
+                "contest_id": self.contest.id,
+                "cluster_id": self.cluster.id,
+                "journal": True,
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        existing_assignment.refresh_from_db()
+        self.assertEqual(existing_assignment.contestid, other_contest.id)
+        self.assertTrue(existing_assignment.presentation)
+        self.assertFalse(existing_assignment.journal)
+        self.assertFalse(MapContestToJudge.objects.filter(
+            contestid=self.contest.id, judgeid=self.judge.id
+        ).exists())
 
     def test_assign_judge_rejects_invalid_sheet_type_without_partial_mapping(self):
         MapContestToCluster.objects.create(
@@ -774,6 +1197,37 @@ class MappingAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['contests'][0]['id'], self.contest.id)
 
+    def test_organizer_cannot_view_judge_contests_they_do_not_manage(self):
+        other_contest = Contest.objects.create(
+            name="Unmanaged Judge Contest", date=date.today(), is_open=True,
+            is_tabulated=False,
+        )
+        MapContestToJudge.objects.create(
+            contestid=self.contest.id, judgeid=self.judge.id
+        )
+        MapContestToJudge.objects.create(
+            contestid=other_contest.id, judgeid=self.judge.id
+        )
+        organizer_user = User.objects.create_user(
+            username="partial-judge-contest-organizer@example.com",
+            password="testpassword",
+        )
+        MapUserToRole.objects.create(
+            uuid=organizer_user.id,
+            role=MapUserToRole.RoleEnum.ORGANIZER,
+            relatedid=self.organizer.id,
+        )
+        MapContestToOrganizer.objects.create(
+            contestid=self.contest.id, organizerid=self.organizer.id
+        )
+        self.client.force_authenticate(user=organizer_user)
+
+        response = self.client.get(
+            reverse('get_judge_contests', args=[self.judge.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
     def test_missing_judge_contests_returns_not_found(self):
         response = self.client.get(reverse('get_judge_contests', args=[999999]))
 
@@ -893,6 +1347,37 @@ class MappingAPITests(APITestCase):
         data = [{"id": self.team.id}]
         response = self.client.post(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data[self.team.id]["username"], "coach@example.com")
+
+    def test_public_coaches_by_teams_does_not_expose_login_email(self):
+        """Public contest pages can show coach names without exposing account emails."""
+        from ..models import Coach, MapCoachToTeam, MapUserToRole
+        coach = Coach.objects.create(first_name="Public", last_name="Coach")
+        MapCoachToTeam.objects.create(teamid=self.team.id, coachid=coach.id)
+        coach_user = User.objects.create_user(
+            username="private-coach@example.com", password="password"
+        )
+        MapUserToRole.objects.create(uuid=coach_user.id, role=4, relatedid=coach.id)
+        self.client.logout()
+
+        response = self.client.post(
+            reverse("coaches_by_teams"), [{"id": self.team.id}], format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        coach_data = response.data[self.team.id]
+        self.assertEqual(coach_data["first_name"], "Public")
+        self.assertNotIn("username", coach_data)
+
+    def test_coaches_by_teams_rejects_invalid_or_oversized_lists(self):
+        url = reverse("coaches_by_teams")
+        invalid = self.client.post(url, [{"id": True}], format="json")
+        oversized = self.client.post(
+            url, [{"id": self.team.id}] * 101, format="json"
+        )
+
+        self.assertEqual(invalid.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(oversized.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_get_teams_by_cluster_rank(self):
         """Test getting teams by cluster rank"""
@@ -966,6 +1451,189 @@ class MappingAPITests(APITestCase):
         response = self.client.post(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertTrue(response.data[self.contest.id])
+
+    def test_contest_submission_status_requires_every_configured_sheet(self):
+        cluster = JudgeClusters.objects.create(cluster_name="Configured Sheets")
+        MapContestToCluster.objects.create(contestid=self.contest.id, clusterid=cluster.id)
+        MapClusterToTeam.objects.create(clusterid=cluster.id, teamid=self.team.id)
+        MapJudgeToCluster.objects.create(
+            judgeid=self.judge.id, clusterid=cluster.id,
+            presentation=True, journal=True,
+        )
+        presentation = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION,
+            isSubmitted=True,
+            **{f"field{number}": 0 for number in range(1, 9)},
+        )
+        MapScoresheetToTeamJudge.objects.create(
+            teamid=self.team.id, judgeid=self.judge.id,
+            scoresheetid=presentation.id, sheetType=ScoresheetEnum.PRESENTATION,
+        )
+        url = reverse("all_sheets_submitted_for_contests")
+
+        response = self.client.post(url, [{"id": self.contest.id}], format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertFalse(response.data[self.contest.id])
+
+        journal = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.JOURNAL,
+            isSubmitted=True,
+            **{f"field{number}": 0 for number in range(1, 9)},
+        )
+        MapScoresheetToTeamJudge.objects.create(
+            teamid=self.team.id, judgeid=self.judge.id,
+            scoresheetid=journal.id, sheetType=ScoresheetEnum.JOURNAL,
+        )
+        response = self.client.post(url, [{"id": self.contest.id}], format="json")
+        self.assertTrue(response.data[self.contest.id])
+
+    def test_contest_submission_status_ignores_internal_all_teams_cluster(self):
+        all_teams_cluster = JudgeClusters.objects.create(cluster_name="All Teams")
+        scoring_cluster = JudgeClusters.objects.create(cluster_name="Presentation")
+        for cluster in (all_teams_cluster, scoring_cluster):
+            MapContestToCluster.objects.create(
+                contestid=self.contest.id, clusterid=cluster.id
+            )
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=self.team.id)
+        MapClusterToTeam.objects.create(
+            clusterid=all_teams_cluster.id, teamid=self.team.id
+        )
+        MapClusterToTeam.objects.create(clusterid=scoring_cluster.id, teamid=self.team.id)
+        MapJudgeToCluster.objects.create(
+            judgeid=self.judge.id,
+            clusterid=scoring_cluster.id,
+            contestid=self.contest.id,
+            presentation=True,
+        )
+        sheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION,
+            isSubmitted=True,
+            **{f"field{number}": 0 for number in range(1, 9)},
+        )
+        MapScoresheetToTeamJudge.objects.create(
+            teamid=self.team.id,
+            judgeid=self.judge.id,
+            scoresheetid=sheet.id,
+            sheetType=ScoresheetEnum.PRESENTATION,
+        )
+
+        response = self.client.post(
+            reverse("all_sheets_submitted_for_contests"),
+            [{"id": self.contest.id}],
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertTrue(response.data[self.contest.id])
+
+    def test_contest_submission_status_does_not_mix_unrelated_clusters(self):
+        judge_cluster = JudgeClusters.objects.create(cluster_name="Judge Cluster")
+        team_cluster = JudgeClusters.objects.create(cluster_name="Team Cluster")
+        for cluster in (judge_cluster, team_cluster):
+            MapContestToCluster.objects.create(
+                contestid=self.contest.id, clusterid=cluster.id
+            )
+        MapJudgeToCluster.objects.create(
+            judgeid=self.judge.id, clusterid=judge_cluster.id, presentation=True
+        )
+        MapClusterToTeam.objects.create(
+            clusterid=team_cluster.id, teamid=self.team.id
+        )
+
+        response = self.client.post(
+            reverse("all_sheets_submitted_for_contests"),
+            [{"id": self.contest.id}],
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertFalse(response.data[self.contest.id])
+
+    def test_contest_submission_status_ignores_other_contest_assignments_in_shared_cluster(self):
+        from datetime import date
+
+        other_contest = Contest.objects.create(
+            name="Other Contest", date=date.today(), is_open=True, is_tabulated=False
+        )
+        shared_cluster = JudgeClusters.objects.create(cluster_name="Shared Cluster")
+        MapContestToCluster.objects.create(
+            contestid=self.contest.id, clusterid=shared_cluster.id
+        )
+        MapContestToCluster.objects.create(
+            contestid=other_contest.id, clusterid=shared_cluster.id
+        )
+
+        other_team = Teams.objects.create(team_name="Other Contest Team")
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=self.team.id)
+        MapContestToTeam.objects.create(contestid=other_contest.id, teamid=other_team.id)
+        MapClusterToTeam.objects.create(clusterid=shared_cluster.id, teamid=self.team.id)
+        MapClusterToTeam.objects.create(clusterid=shared_cluster.id, teamid=other_team.id)
+
+        MapJudgeToCluster.objects.create(
+            judgeid=self.judge.id,
+            clusterid=shared_cluster.id,
+            contestid=self.contest.id,
+            presentation=True,
+        )
+        other_judge = Judge.objects.create(
+            first_name="Other", last_name="Judge", phone_number="555-0100",
+            contestid=other_contest.id,
+        )
+        MapJudgeToCluster.objects.create(
+            judgeid=other_judge.id,
+            clusterid=shared_cluster.id,
+            contestid=other_contest.id,
+            presentation=True,
+        )
+
+        sheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION,
+            isSubmitted=True,
+            **{f"field{number}": 0 for number in range(1, 9)},
+        )
+        MapScoresheetToTeamJudge.objects.create(
+            teamid=self.team.id,
+            judgeid=self.judge.id,
+            scoresheetid=sheet.id,
+            sheetType=ScoresheetEnum.PRESENTATION,
+        )
+
+        response = self.client.post(
+            reverse("all_sheets_submitted_for_contests"),
+            [{"id": self.contest.id}],
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertTrue(response.data[self.contest.id])
+
+    def test_shared_cluster_legacy_judge_assignment_is_not_assumed_to_belong_to_contest(self):
+        from datetime import date
+
+        other_contest = Contest.objects.create(
+            name="Other Contest", date=date.today(), is_open=True, is_tabulated=False
+        )
+        shared_cluster = JudgeClusters.objects.create(cluster_name="Legacy Shared Cluster")
+        MapContestToCluster.objects.create(
+            contestid=self.contest.id, clusterid=shared_cluster.id
+        )
+        MapContestToCluster.objects.create(
+            contestid=other_contest.id, clusterid=shared_cluster.id
+        )
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=self.team.id)
+        MapClusterToTeam.objects.create(clusterid=shared_cluster.id, teamid=self.team.id)
+        MapJudgeToCluster.objects.create(
+            judgeid=self.judge.id, clusterid=shared_cluster.id, presentation=True
+        )
+
+        response = self.client.post(
+            reverse("all_sheets_submitted_for_contests"),
+            [{"id": self.contest.id}],
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertFalse(response.data[self.contest.id])
 
     def test_all_sheets_submitted_for_contests_rejects_malformed_body(self):
         response = self.client.post(

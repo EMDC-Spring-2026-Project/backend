@@ -154,6 +154,37 @@ class TeamAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
 
     @patch("emdcbackend.views.coach.send_set_password_email")
+    @patch("emdcbackend.views.team.create_team_to_contest_map", side_effect=RuntimeError("sensitive database detail"))
+    def test_create_team_hides_unexpected_errors_and_rolls_back(
+        self, _mock_contest_map, _mock_send_email
+    ):
+        initial_counts = (Teams.objects.count(), Coach.objects.count(), User.objects.count())
+        response = self.client.post(
+            reverse('create_team'),
+            {
+                "username": "error-coach@example.com",
+                "password": "coachpassword",
+                "first_name": "Error",
+                "last_name": "Coach",
+                "team_name": "Error Team",
+                "contestid": self.contest.id,
+                "clusterid": self.cluster.id,
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(
+            response.data["detail"],
+            "Unable to create the team due to an unexpected server error.",
+        )
+        self.assertNotIn("sensitive database detail", str(response.data))
+        self.assertEqual(
+            (Teams.objects.count(), Coach.objects.count(), User.objects.count()),
+            initial_counts,
+        )
+
+    @patch("emdcbackend.views.coach.send_set_password_email")
     @patch("emdcbackend.views.team.make_sheets_for_team", side_effect=RuntimeError("generation failed"))
     def test_create_team_rolls_back_if_scoresheet_generation_fails(
         self, _mock_make_sheets, mock_send_email
@@ -260,6 +291,73 @@ class TeamAPITests(APITestCase):
         self.assertEqual(team.team_name, "Updated Team")
         self.assertEqual(coach.first_name, "Original")
         self.assertEqual(coach.last_name, "Coach")
+
+    def test_edit_team_can_reassign_existing_coach_without_resending_names(self):
+        team = Teams.objects.create(team_name="Shared Team")
+        original_coach = Coach.objects.create(first_name="Original", last_name="Coach")
+        original_user = User.objects.create_user(
+            username="original-coach@example.com", password="password"
+        )
+        MapUserToRole.objects.create(
+            uuid=original_user.id, role=4, relatedid=original_coach.id
+        )
+        from ..models import MapCoachToTeam
+        MapCoachToTeam.objects.create(teamid=team.id, coachid=original_coach.id)
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=team.id)
+
+        existing_coach = Coach.objects.create(first_name="Existing", last_name="Coach")
+        existing_user = User.objects.create_user(
+            username="existing-coach@example.com", password="password"
+        )
+        MapUserToRole.objects.create(
+            uuid=existing_user.id, role=4, relatedid=existing_coach.id
+        )
+
+        response = self.client.post(
+            reverse('edit_team'),
+            {"id": team.id, "username": existing_user.username},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        existing_coach.refresh_from_db()
+        self.assertEqual(existing_coach.first_name, "Existing")
+        self.assertEqual(existing_coach.last_name, "Coach")
+        self.assertTrue(
+            MapCoachToTeam.objects.filter(
+                teamid=team.id, coachid=existing_coach.id
+            ).exists()
+        )
+        self.assertFalse(
+            MapCoachToTeam.objects.filter(teamid=team.id, coachid=original_coach.id).exists()
+        )
+
+    @patch("emdcbackend.views.team.ScoresheetSerializer", side_effect=RuntimeError("sensitive database detail"))
+    def test_edit_team_rolls_back_and_hides_unexpected_errors(self, _mock_serializer):
+        team = Teams.objects.create(team_name="Original Team")
+        coach = Coach.objects.create(first_name="Original", last_name="Coach")
+        coach_user = User.objects.create_user(
+            username="rollback-coach@example.com", password="password"
+        )
+        MapUserToRole.objects.create(uuid=coach_user.id, role=4, relatedid=coach.id)
+        from ..models import MapCoachToTeam
+        MapCoachToTeam.objects.create(teamid=team.id, coachid=coach.id)
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=team.id)
+
+        response = self.client.post(
+            reverse('edit_team'),
+            {"id": team.id, "team_name": "Changed Team"},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(
+            response.data["detail"],
+            "Unable to update the team due to an unexpected server error.",
+        )
+        self.assertNotIn("sensitive database detail", str(response.data))
+        team.refresh_from_db()
+        self.assertEqual(team.team_name, "Original Team")
 
     def test_delete_team_by_id(self):
         team = Teams.objects.create(

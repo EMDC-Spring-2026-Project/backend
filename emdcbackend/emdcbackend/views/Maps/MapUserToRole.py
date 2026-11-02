@@ -1,3 +1,5 @@
+import logging
+
 from django.contrib.auth.models import User
 from django.db import transaction
 from rest_framework import status
@@ -13,9 +15,19 @@ from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 
 from ...auth.serializers import UserSerializer
-from ...models import MapUserToRole, Coach, Organizer, Judge, Admin
+from ...models import (
+    MapUserToRole,
+    Coach,
+    Organizer,
+    Judge,
+    Admin,
+    MapContestToJudge,
+    MapContestToOrganizer,
+)
 from ...serializers import MapUserToRoleSerializer, CoachSerializer, OrganizerSerializer, JudgeSerializer, AdminSerializer
 from django.shortcuts import get_object_or_404
+
+logger = logging.getLogger(__name__)
 
 #from rest_framework.response import Response
 from rest_framework import status
@@ -48,19 +60,64 @@ def create_user_role_mapping(request):
         # Handle validation errors and return a 400 response
         return Response({"errors": e.detail}, status=status.HTTP_400_BAD_REQUEST)
 
-    except Exception as e:
-        # Handle any other exceptions
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while creating user-role mapping")
+        return Response(
+            {"detail": "Unable to save the user role due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 @api_view(['GET'])
 def login_return(request, userid):
     return Response(get_role(userid), status=status.HTTP_200_OK)
+
+
+def _can_view_role_account(user, relatedid, role_type):
+    if _is_admin(user):
+        return True
+
+    current_role = MapUserToRole.objects.filter(uuid=user.id).first()
+    if not current_role:
+        return False
+
+    # Users may view their own account identifier.
+    if current_role.role == role_type and current_role.relatedid == relatedid:
+        return True
+
+    # Organizers need a judge's account identifier to manage that judge from
+    # their contest dashboard. A judge can be shared across contests, so only
+    # expose it when this organizer manages every contest assigned to them.
+    if (
+        role_type != MapUserToRole.RoleEnum.JUDGE
+        or current_role.role != MapUserToRole.RoleEnum.ORGANIZER
+    ):
+        return False
+
+    contest_ids = set(
+        MapContestToJudge.objects.filter(judgeid=relatedid)
+        .values_list("contestid", flat=True)
+    )
+    if not contest_ids:
+        return False
+
+    managed_contest_ids = set(
+        MapContestToOrganizer.objects.filter(
+            organizerid=current_role.relatedid,
+            contestid__in=contest_ids,
+        ).values_list("contestid", flat=True)
+    )
+    return contest_ids.issubset(managed_contest_ids)
 
 @api_view(['GET'])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def get_user_by_role(request, relatedid, roleType):
     try:
+        if not _can_view_role_account(request.user, relatedid, roleType):
+            return Response(
+                {"detail": "You are not allowed to view this account."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         mapping = MapUserToRole.objects.get(relatedid=relatedid, role=roleType)
         uuid = mapping.uuid
         user = get_object_or_404(User, id=uuid)

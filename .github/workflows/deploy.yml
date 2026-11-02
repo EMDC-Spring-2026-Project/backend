@@ -1,24 +1,7 @@
-name: Deploy Backend
+name: Deployment Provider Check
 
 on:
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Deployment environment'
-        required: true
-        default: 'production'
-        type: choice
-        options:
-          - production
-          - staging
-  push:
-    branches:
-      - main
-    # Uncomment to enable automatic deployment on push to main
-    # paths:
-    #   - 'emdcbackend/**'
-    #   - 'requirements.txt'
-    #   - 'Dockerfile'
+  workflow_dispatch: {}
 
 jobs:
   test:
@@ -70,10 +53,9 @@ jobs:
           python manage.py test emdcbackend.test --verbosity=2
 
   deploy:
-    name: Deploy to ${{ github.event.inputs.environment || 'production' }}
+    name: Confirm deployment is not configured
     runs-on: ubuntu-latest
     needs: test
-    environment: ${{ github.event.inputs.environment || 'production' }}
     
     steps:
       - name: Checkout code
@@ -161,10 +143,11 @@ jobs:
       #       python manage.py collectstatic --noinput
       #       sudo systemctl restart emdc-backend
 
-      - name: Deployment complete
+      - name: Stop until a hosting provider is configured
         run: |
-          echo "✅ Deployment to ${{ github.event.inputs.environment || 'production' }} completed successfully!"
-          echo "🔗 API URL: ${{ secrets.API_URL }}"
+          echo "No deployment provider is configured. The provider examples above are templates only."
+          echo "Choose and configure the department's hosting provider before enabling this workflow."
+          exit 1
 
   health-check:
     name: Post-deployment Health Check
@@ -176,13 +159,23 @@ jobs:
         run: sleep 30
 
       - name: Check API health
+        env:
+          API_URL: ${{ secrets.API_URL }}
         run: |
-          response=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.API_URL }}/api/health/ || echo "000")
+          if [ -z "$API_URL" ]; then
+            echo "❌ API_URL is required after a deployment provider is configured"
+            exit 1
+          fi
+          case "$API_URL" in
+            https://*) ;;
+            *) echo "❌ API_URL must use HTTPS"; exit 1 ;;
+          esac
+
+          response=$(curl --silent --show-error --output /dev/null --write-out "%{http_code}" --max-time 15 "${API_URL%/}/api/health/" || echo "000")
           if [ "$response" = "200" ]; then
             echo "✅ Health check passed"
           else
             echo "❌ Health check failed with status code: $response"
             exit 1
           fi
-        continue-on-error: true
 

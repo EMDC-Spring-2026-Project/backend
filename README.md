@@ -76,11 +76,13 @@ The server will be available at `http://127.0.0.1:7004/`
 
 ### Production Server
 
-For production, use a WSGI server like Gunicorn:
+The production Docker image starts Gunicorn. To run it outside Docker, install the requirements (which include Gunicorn) and run:
 
 ```bash
-gunicorn emdcbackend.wsgi:application
+gunicorn --bind 0.0.0.0:7004 --workers 3 --access-logfile - --error-logfile - emdcbackend.wsgi:application
 ```
+
+Keep `DEBUG=0`, set a unique `DJANGO_SECRET_KEY`, configure the production database and allowed hosts, and run Django's deployment checks before going live. The local Docker Compose setup overrides the image command to use Django's auto-reloading development server.
 
 ## API Documentation
 
@@ -149,15 +151,16 @@ gunicorn emdcbackend.wsgi:application
 
 ## 🚀 CI/CD Pipeline
 
-This project uses **GitHub Actions** for continuous integration and deployment:
+This project uses **GitHub Actions** for checks and Docker image builds. This repository's automated production deployment is not configured yet; the public site could be hosted separately:
 
-- ✅ **Automated Testing**: 301 tests run on every push and PR
+- ✅ **Automated Testing**: Backend tests run on every push and pull request
 - ✅ **Code Quality**: Flake8, Black, and isort validation
-- ✅ **Security Scanning**: Safety and Bandit security checks
+- ✅ **Security Scanning**: `pip-audit` checks dependencies; Bandit runs as an advisory scan
 - ✅ **Migration Checks**: Ensures no missing migrations
 - ✅ **Docker Images**: Automated builds pushed to GitHub Container Registry
-- ✅ **Deployment**: Templates for DigitalOcean, Heroku, AWS, and VPS
-- ✅ **Health Checks**: Post-deployment verification
+- ⚠️ **Deployment**: Provider examples are templates only; the manual deployment workflow stops until a provider is configured
+
+Note: the current Flake8, Black, and isort jobs report findings but are configured as advisory, so those findings do not block a merge. The dependency vulnerability scan and test job do block on failure.
 
 **📖 For detailed CI/CD documentation, see [CI-CD.md](./CI-CD.md)**
 
@@ -165,11 +168,11 @@ This project uses **GitHub Actions** for continuous integration and deployment:
 
 1. **ci.yml** - Runs tests, linting, security scans, and migration checks
 2. **docker.yml** - Builds and publishes Docker images
-3. **deploy.yml** - Deploys to production/staging with health checks
+3. **deploy.yml** - Manual-only template; no production deployment is configured
 
 ## Testing
 
-The project includes comprehensive test coverage with **301 tests** covering:
+The project includes automated test coverage (493 tests passed locally on October 28, 2026) covering:
 
 - API endpoints
 - Security (SQL injection, XSS, authentication)
@@ -199,10 +202,8 @@ coverage report
 
 ### Test Coverage
 
-- **301 tests total**
-- **301 passing in the isolated SQLite validation run**
-- **0 skipped in that run**
-- PostgreSQL and browser integration validation remain required.
+- **493 backend tests passed** in the Docker-based PostgreSQL validation on October 28, 2026.
+- Frontend browser-based and live-hosting validation remain required before launch.
 
 ## Project Structure
 

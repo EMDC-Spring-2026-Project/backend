@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework import status
 from rest_framework.decorators import (
     api_view,
@@ -14,15 +16,20 @@ from django.db import transaction
 from ...models import (
     MapScoresheetToTeamJudge,
     Scoresheet,
+    ScoresheetEnum,
     MapContestToJudge,
     MapJudgeToCluster,
     MapClusterToTeam,
     MapContestToCluster,
     MapContestToTeam,
     MapContestToOrganizer,
+    JudgeClusters,
     MapUserToRole,
 )
 from ...serializers import MapScoreSheetToTeamJudgeSerializer, ScoresheetSerializer
+from ...views.contest_utils import judge_cluster_assignments_for_contest
+
+logger = logging.getLogger(__name__)
 
 
 def _is_admin(user):
@@ -97,8 +104,12 @@ def create_score_sheet_mapping(request):
     except ValidationError as e:
         return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
 
-    except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while creating a scoresheet mapping")
+        return Response(
+            {"detail": "Unable to create the scoresheet mapping."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 @api_view(["GET"])
@@ -239,8 +250,12 @@ def score_sheets_by_judge(request, judge_id):
 
         return Response({"ScoreSheets": results}, status=status.HTTP_200_OK)
 
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading judge/cluster scoresheets")
+        return Response(
+            {"error": "Unable to load the scoresheets."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 @api_view(["GET"])
@@ -311,8 +326,12 @@ def score_sheets_by_judge_and_cluster(request, judge_id, cluster_id):
 
         return Response({"ScoreSheets": results}, status=status.HTTP_200_OK)
 
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while checking contest scoresheet submissions")
+        return Response(
+            {"error": "Unable to check scoresheet submission status."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 @api_view(["POST"])
@@ -342,28 +361,79 @@ def all_sheets_submitted_for_contests(request):
                     status=status.HTTP_403_FORBIDDEN,
                 )
             
-            # Get all clusters for this contest
-            contest_cluster_mappings = MapContestToCluster.objects.filter(contestid=contest_id)
-            cluster_ids = contest_cluster_mappings.values_list('clusterid', flat=True).distinct()
+            # Keep this status scoped to the selected contest. Clusters and
+            # teams can be shared, so looking up every assignment/team by
+            # cluster ID alone can mix another contest's progress into this
+            # response.
+            cluster_ids = list(
+                MapContestToCluster.objects.filter(contestid=contest_id)
+                .values_list("clusterid", flat=True)
+                .distinct()
+            )
             
             if not cluster_ids:
                 # No clusters in contest, so no judges to check
                 results[contest_id] = True
                 continue
+
+            # Each contest has an internal "All Teams" roster group. It is
+            # not a scoring cluster and has no judge assignments, so counting
+            # it here would make an otherwise completed contest look pending.
+            all_teams_cluster_ids = set(
+                JudgeClusters.objects.filter(
+                    id__in=cluster_ids,
+                    cluster_name__iexact="All Teams",
+                ).values_list("id", flat=True)
+            )
+            cluster_ids = [
+                cluster_id for cluster_id in cluster_ids
+                if cluster_id not in all_teams_cluster_ids
+            ]
+            if not cluster_ids:
+                # A roster-only contest has no scored work to mark complete.
+                results[contest_id] = False
+                continue
             
-            # Get all judges assigned to clusters in this contest
-            judge_cluster_mappings = MapJudgeToCluster.objects.filter(clusterid__in=cluster_ids)
-            judge_ids = judge_cluster_mappings.values_list('judgeid', flat=True).distinct()
+            # New assignments record the contest explicitly. A legacy mapping
+            # without contestid is only safe to use when its cluster belongs
+            # to this one contest; on a shared cluster it is ambiguous.
+            judge_cluster_mappings = list(
+                judge_cluster_assignments_for_contest(contest_id, cluster_ids)
+            )
             
-            if not judge_ids:
+            if not judge_cluster_mappings:
                 # No judges assigned to clusters in this contest
                 # Cannot say all sheets are submitted if there are no judges
                 results[contest_id] = False
                 continue
             
-            # Get all teams in clusters for this contest
+            # If contest-team links exist, use them to exclude teams belonging
+            # only to another contest that happens to share the same cluster.
+            contest_team_ids = set(
+                MapContestToTeam.objects.filter(contestid=contest_id)
+                .values_list("teamid", flat=True)
+            )
             team_cluster_mappings = MapClusterToTeam.objects.filter(clusterid__in=cluster_ids)
-            team_ids = team_cluster_mappings.values_list('teamid', flat=True).distinct()
+            if contest_team_ids:
+                team_cluster_mappings = team_cluster_mappings.filter(teamid__in=contest_team_ids)
+            else:
+                contests_by_cluster = {}
+                for cluster_id, mapped_contest_id in MapContestToCluster.objects.filter(
+                    clusterid__in=cluster_ids
+                ).values_list("clusterid", "contestid"):
+                    contests_by_cluster.setdefault(cluster_id, set()).add(mapped_contest_id)
+                if any(
+                    len(contests_by_cluster.get(cluster_id, set())) > 1
+                    for cluster_id in cluster_ids
+                ):
+                    # Without contest-team links there is no reliable way to
+                    # distinguish teams in a shared cluster, so fail closed.
+                    results[contest_id] = False
+                    continue
+            teams_by_cluster = {}
+            for cluster_id, team_id in team_cluster_mappings.values_list("clusterid", "teamid"):
+                teams_by_cluster.setdefault(cluster_id, set()).add(team_id)
+            team_ids = set().union(*teams_by_cluster.values()) if teams_by_cluster else set()
             
             if not team_ids:
                 # No teams in clusters, so no score sheets to check
@@ -371,46 +441,79 @@ def all_sheets_submitted_for_contests(request):
                 results[contest_id] = False
                 continue
             
-            # Check if all score sheets for judges and teams in this contest are submitted
             all_submitted = True
-            
-            for judge_id in judge_ids:
-                # Get all score sheet mappings for this judge and teams in contest clusters
-                score_sheet_mappings = MapScoresheetToTeamJudge.objects.filter(
-                    judgeid=judge_id,
-                    teamid__in=team_ids
-                )
-                
-                if not score_sheet_mappings.exists():
-                    # Judge has no score sheet mappings for teams in this contest
-                    # This could mean they haven't been assigned yet, so consider as not submitted
+            assigned_cluster_ids = {
+                assignment.clusterid for assignment in judge_cluster_mappings
+            }
+            if any(
+                cluster_team_ids and cluster_id not in assigned_cluster_ids
+                for cluster_id, cluster_team_ids in teams_by_cluster.items()
+            ):
+                all_submitted = False
+            required_sheet_flags = (
+                ("presentation", ScoresheetEnum.PRESENTATION),
+                ("journal", ScoresheetEnum.JOURNAL),
+                ("mdo", ScoresheetEnum.MACHINEDESIGN),
+                ("runpenalties", ScoresheetEnum.RUNPENALTIES),
+                ("otherpenalties", ScoresheetEnum.OTHERPENALTIES),
+                ("redesign", ScoresheetEnum.REDESIGN),
+                ("championship", ScoresheetEnum.CHAMPIONSHIP),
+            )
+            checked_assignment_team_pair = False
+            for assignment in judge_cluster_mappings:
+                if not all_submitted:
+                    break
+                cluster_team_ids = teams_by_cluster.get(assignment.clusterid, set())
+                if not cluster_team_ids:
+                    continue
+                expected_types = [
+                    sheet_type
+                    for flag, sheet_type in required_sheet_flags
+                    if getattr(assignment, flag)
+                ]
+                if not expected_types:
                     all_submitted = False
                     break
-                
-                # Get all score sheet IDs for this judge's mappings in this contest
-                scoresheet_ids = list(score_sheet_mappings.values_list('scoresheetid', flat=True))
-                
-                # Check if all scoresheets referenced by mappings actually exist
-                # If mappings exist but scoresheets don't, consider as not submitted
-                existing_scoresheets = Scoresheet.objects.filter(id__in=scoresheet_ids)
-                if existing_scoresheets.count() < len(scoresheet_ids):
-                    # Some scoresheets referenced by mappings don't exist (orphaned mappings)
-                    all_submitted = False
+
+                for team_id in cluster_team_ids:
+                    checked_assignment_team_pair = True
+                    for sheet_type in expected_types:
+                        score_sheet_mappings = MapScoresheetToTeamJudge.objects.filter(
+                            judgeid=assignment.judgeid,
+                            teamid=team_id,
+                            sheetType=sheet_type,
+                        )
+                        if not score_sheet_mappings.exists():
+                            all_submitted = False
+                            break
+                        scoresheet_ids = list(
+                            score_sheet_mappings.values_list("scoresheetid", flat=True)
+                        )
+                        existing_scoresheets = Scoresheet.objects.filter(id__in=scoresheet_ids)
+                        if (
+                            existing_scoresheets.count() < len(scoresheet_ids)
+                            or existing_scoresheets.filter(isSubmitted=False).exists()
+                        ):
+                            all_submitted = False
+                            break
+                    if not all_submitted:
+                        break
+                if not all_submitted:
                     break
-                
-                # Check if any score sheet is not submitted
-                unsubmitted_count = existing_scoresheets.filter(isSubmitted=False).count()
-                
-                if unsubmitted_count > 0:
-                    all_submitted = False
-                    break
+
+            if not checked_assignment_team_pair:
+                all_submitted = False
             
             results[contest_id] = all_submitted
 
         return Response(results, status=status.HTTP_200_OK)
 
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while checking contest scoresheet submissions")
+        return Response(
+            {"error": "Unable to check scoresheet submission status."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 @api_view(["POST"])
@@ -451,8 +554,12 @@ def submit_all_penalty_sheets_for_judge(request):
     except DjangoValidationError as e:
         details = e.message_dict if hasattr(e, "message_dict") else e.messages
         return Response({"errors": details}, status=status.HTTP_400_BAD_REQUEST)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while submitting penalty scoresheets")
+        return Response(
+            {"error": "Unable to submit the penalty scoresheets."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 @api_view(["DELETE"])
 @authentication_classes([SessionAuthentication])
@@ -530,5 +637,9 @@ def all_submitted_for_team(request, team_id: int):
             "totalCount": total,
             "allSubmitted": submitted_count == total,
         }, status=status.HTTP_200_OK)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while checking score sheet submission status")
+        return Response(
+            {"error": "Unable to load submission status due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )

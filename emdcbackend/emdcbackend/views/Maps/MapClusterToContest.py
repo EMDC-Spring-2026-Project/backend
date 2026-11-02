@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework import status
 from rest_framework.decorators import (
     api_view,
@@ -12,7 +14,7 @@ from django.shortcuts import get_object_or_404
 from ...models import JudgeClusters, Contest, MapContestToCluster
 from ...serializers import JudgeClustersSerializer, ContestSerializer, ClusterToContestSerializer
 
-
+logger = logging.getLogger(__name__)
 
 @api_view(["GET"])
 @authentication_classes([SessionAuthentication])
@@ -95,5 +97,6 @@ def get_all_teams_cluster(contest_id):
 
     except JudgeClusters.DoesNotExist:
         return {"error": "'All Teams' cluster not found."}, None
-    except Exception as e:
-        return {"error": str(e)}, None
+    except Exception:
+        logger.exception("Unexpected error while looking up All Teams cluster for contest %s", contest_id)
+        return {"error": "Unable to load the All Teams cluster due to a server error."}, None

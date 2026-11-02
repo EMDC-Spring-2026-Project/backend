@@ -3,6 +3,7 @@ from rest_framework.test import APITestCase
 from rest_framework import status
 from django.contrib.auth.models import User
 from datetime import date
+from unittest.mock import patch
 from ..models import (
     Contest, Teams, Judge, JudgeClusters, MapContestToTeam, MapContestToOrganizer,
     MapUserToRole, Organizer, MapClusterToTeam, MapContestToCluster
@@ -145,6 +146,37 @@ class AdvanceAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.team.refresh_from_db()
         self.assertFalse(self.team.advanced_to_championship)
+
+    @patch("emdcbackend.views.advance.recompute_totals_and_ranks", side_effect=RuntimeError("rank refresh failed"))
+    def test_undo_rolls_back_when_rank_refresh_fails(self, _recompute):
+        self.team.advanced_to_championship = True
+        self.team.save()
+
+        response = self.client.post(
+            reverse("undo_championship_advancement"),
+            {"contestid": self.contest.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.team.refresh_from_db()
+        self.assertTrue(self.team.advanced_to_championship)
+        self.assertEqual(response.data["message"], "Could not undo championship advancement. No changes were saved; please try again or contact support.")
+
+    @patch("emdcbackend.views.scoresheets.create_scoresheets_for_judges_in_cluster", side_effect=RuntimeError("scoresheet creation failed"))
+    def test_undo_rolls_back_when_preliminary_scoresheets_cannot_be_created(self, _create_sheets):
+        self.team.advanced_to_championship = True
+        self.team.save()
+
+        response = self.client.post(
+            reverse("undo_championship_advancement"),
+            {"contestid": self.contest.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.team.refresh_from_db()
+        self.assertTrue(self.team.advanced_to_championship)
 
     def test_undo_championship_advancement_missing_contestid(self):
         """Test undo_championship_advancement with missing contestid"""

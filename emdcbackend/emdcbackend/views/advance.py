@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework import status
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.response import Response
@@ -18,6 +20,8 @@ from ..models import (
     MapScoresheetToTeamJudge,
 )
 from .tabulation import recompute_totals_and_ranks, _ensure_requester_is_organizer_of_contest
+
+logger = logging.getLogger(__name__)
 
 
 @api_view(["POST"])
@@ -213,9 +217,10 @@ def advance_to_championship(request):
             }
         }, status=200)
         
-    except Exception as e:
+    except Exception:
         transaction.set_rollback(True)
-        return Response({"ok": False, "message": f"Error during championship advancement: {str(e)}"}, status=500)
+        logger.exception("Could not complete championship advancement for contest %s", contest_id)
+        return Response({"ok": False, "message": "Could not complete championship advancement. No changes were saved; please try again or contact support."}, status=500)
 
 
 @api_view(["POST"])
@@ -356,12 +361,8 @@ def undo_championship_advancement(request):
             #  Only creates scoresheets for judges who are already in preliminary clusters
             # Judges who were ONLY in championship/redesign clusters will not get preliminary scoresheets
             # and will see nothing on their dashboard 
-            try:
-                from .scoresheets import create_scoresheets_for_judges_in_cluster
-                created_sheets = create_scoresheets_for_judges_in_cluster(main_cluster.id)
-            except Exception as e:
-                # Log error but don't fail the entire operation
-                import traceback
+            from .scoresheets import create_scoresheets_for_judges_in_cluster
+            create_scoresheets_for_judges_in_cluster(main_cluster.id)
         
         # 7. Reset judge championship/redesign flags for this contest's clusters
       
@@ -411,12 +412,9 @@ def undo_championship_advancement(request):
                     continue
         
         # 8. Recompute totals and ranks
-        try:
-            recompute_totals_and_ranks(contest_id)
-        except Exception as recompute_error:
-            # Don't fail the entire operation for recompute errors
-            # The scores will be recomputed later when needed
-            pass
+        # The state reset and rank refresh are one operation. If recomputation
+        # fails, roll back the reset instead of reporting success with stale ranks.
+        recompute_totals_and_ranks(contest_id)
 
         return Response({
             "ok": True,
@@ -430,6 +428,5 @@ def undo_championship_advancement(request):
         
     except Exception as e:
         transaction.set_rollback(True)
-        import traceback
-        error_details = traceback.format_exc()
-        return Response({"ok": False, "message": f"Error undoing championship advancement: {str(e)}"}, status=500)
+        logger.exception("Could not undo championship advancement for contest %s", contest_id)
+        return Response({"ok": False, "message": "Could not undo championship advancement. No changes were saved; please try again or contact support."}, status=500)

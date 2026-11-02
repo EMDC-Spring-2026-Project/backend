@@ -1,3 +1,7 @@
+import logging
+
+from django.db import transaction
+from django.db.models import Q
 from rest_framework import status
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.exceptions import ValidationError
@@ -7,6 +11,7 @@ from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth.models import User
 
 from ..models import (
+    Contest,
     Teams,
     Scoresheet,
     MapScoresheetToTeamJudge,
@@ -21,6 +26,9 @@ from ..models import (
     MapContestToJudge,
     Judge,
 )
+from .contest_utils import judge_cluster_assignments_for_contest
+
+logger = logging.getLogger(__name__)
 
 # ---------- Shared Helpers ----------
 
@@ -43,6 +51,93 @@ def sort_by_score_with_id_fallback(teams, score_attr: str):
     return sorted(teams, key=lambda t: (-_score(t), t.id))
 
 
+def _numeric(value):
+    try:
+        return float(value) if value is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _is_disqualified(team):
+    return bool(team.judge_disqualified or team.organizer_disqualified)
+
+
+def sort_by_standard_round_tiebreakers(teams, championship=False):
+    """Apply the official total, machine, presentation, journal tiebreakers."""
+    if championship:
+        return sorted(
+            teams,
+            key=lambda team: (
+                _is_disqualified(team),
+                -_numeric(team.total_score),
+                -_numeric(team.championship_machinedesign_score),
+                -_numeric(team.championship_presentation_score),
+                -_numeric(team.preliminary_journal_score),
+                team.id,
+            ),
+        )
+    return sorted(
+        teams,
+        key=lambda team: (
+            _is_disqualified(team),
+            -_numeric(team.preliminary_total_score),
+            -_numeric(team.preliminary_machinedesign_score),
+            -_numeric(team.preliminary_presentation_score),
+            -_numeric(team.preliminary_journal_score),
+            team.id,
+        ),
+    )
+
+
+def _redesign_tiebreak_scores(team_id, contest_id):
+    active_judge_ids = set(
+        judge_cluster_assignments_for_contest(contest_id).values_list(
+            "judgeid", flat=True
+        )
+    ) | set(
+        MapContestToJudge.objects.filter(contestid=contest_id).values_list(
+            "judgeid", flat=True
+        )
+    )
+    sheet_ids = MapScoresheetToTeamJudge.objects.filter(
+        teamid=team_id,
+        judgeid__in=active_judge_ids,
+        sheetType=ScoresheetEnum.REDESIGN,
+    ).values_list("scoresheetid", flat=True)
+    submitted = list(
+        Scoresheet.objects.filter(
+            id__in=sheet_ids,
+            sheetType=ScoresheetEnum.REDESIGN,
+            isSubmitted=True,
+        ).values_list("field1", "field2")
+    )
+    if not submitted:
+        return (0.0, 0.0)
+    count = len(submitted)
+    return (
+        sum(_numeric(field1) for field1, _ in submitted) / count,
+        sum(_numeric(field2) for _, field2 in submitted) / count,
+    )
+
+
+def sort_by_redesign_tiebreakers(teams, contest_id):
+    teams = list(teams)
+    category_scores = {
+        team.id: _redesign_tiebreak_scores(team.id, contest_id)
+        for team in teams
+    }
+    return sorted(
+        teams,
+        key=lambda team: (
+            _is_disqualified(team),
+            -_numeric(team.redesign_score),
+            -category_scores[team.id][0],
+            -category_scores[team.id][1],
+            team.id,
+        ),
+    )
+
+
 def _compute_totals_for_team(team: Teams, contest_id: int = None):
     """Compute totals and averages for a given team."""
 
@@ -57,14 +152,10 @@ def _compute_totals_for_team(team: Teams, contest_id: int = None):
     # 3) If we can figure out "active judges for this contest", filter to those
     if contest_id:
         # Clusters currently attached to this contest (e.g. championship cluster gets removed on undo)
-        contest_cluster_ids = MapContestToCluster.objects.filter(
-            contestid=contest_id
-        ).values_list("clusterid", flat=True)
-
-        # Judges still mapped into those clusters
-        cluster_judge_ids = set(MapJudgeToCluster.objects.filter(
-            clusterid__in=contest_cluster_ids
-        ).values_list("judgeid", flat=True))
+        cluster_judge_ids = set(
+            judge_cluster_assignments_for_contest(contest_id)
+            .values_list("judgeid", flat=True)
+        )
         contest_judge_ids = set(MapContestToJudge.objects.filter(
             contestid=contest_id
         ).values_list("judgeid", flat=True))
@@ -147,8 +238,8 @@ def _compute_totals_for_team(team: Teams, contest_id: int = None):
             if not hasattr(team, '_redesign_total') or team._redesign_total is None:
                 team._redesign_total = 0
                 team._redesign_judge_count = 0
-            # Sum all redesign fields (1..6) and count judges
-            team._redesign_total += sum((getattr(sheet, f"field{i}", 0) or 0) for i in range(1, 7))
+            # Include all seven rubric categories, including Communication.
+            team._redesign_total += sum((getattr(sheet, f"field{i}", 0) or 0) for i in range(1, 8))
             team._redesign_judge_count += 1
 
         elif sheet.sheetType == ScoresheetEnum.CHAMPIONSHIP:
@@ -174,6 +265,7 @@ def _compute_totals_for_team(team: Teams, contest_id: int = None):
             
             championship_totals[6] += general_penalties_score  # Store general penalties in index 6
             championship_totals[7] += run_penalties_score      # Store run penalties in index 7
+            championship_totals[8] += 1  # Count submitted penalty sheets
 
     # compute averages and totals based on round type
     # Check if team is in championship or redesign cluster
@@ -199,13 +291,18 @@ def _compute_totals_for_team(team: Teams, contest_id: int = None):
     team.preliminary_presentation_score = team.presentation_score  
     team.preliminary_machinedesign_score = team.machinedesign_score  
 
-    # Penalties should be summed (not averaged) because each penalty represents a specific deduction
-    team.preliminary_penalties_score = round(preliminary_totals[6], 2)  # Total OTHERPENALTIES (not averaged)
-    team.penalties_score = round(preliminary_totals[7], 2)  # Total RUNPENALTIES (not averaged)
+    # Separate judging groups may each record the same team's penalties. The
+    # official rule is to average submitted penalty sheets, just like scores.
+    team.preliminary_penalties_score = round(
+        qdiv(preliminary_totals[6], preliminary_totals[11]), 2
+    )
+    team.penalties_score = round(
+        qdiv(preliminary_totals[7], preliminary_totals[8]), 2
+    )
     
     
     # Total penalties for calculation (both types combined)
-    total_penalties = preliminary_totals[6] + preliminary_totals[7]
+    total_penalties = team.preliminary_penalties_score + team.penalties_score
     preliminary_total = (
         team.preliminary_presentation_score + team.preliminary_journal_score + team.preliminary_machinedesign_score
     ) - total_penalties
@@ -225,9 +322,17 @@ def _compute_totals_for_team(team: Teams, contest_id: int = None):
         team.championship_presentation_score = round(qdiv(championship_totals[2], championship_totals[3]) if championship_totals[3] > 0 else 0, 2)  # Average presentation score
         
         # Store separate penalty scores for championship
-        team.championship_general_penalties_score = round(championship_totals[6], 2)  # General penalties (fields 19-25)
-        team.championship_run_penalties_score = round(championship_totals[7], 2)      # Run penalties (fields 26-42)
-        team.championship_penalties_score = round(championship_totals[6] + championship_totals[7], 2)  # Total penalties for calculation
+        team.championship_general_penalties_score = round(
+            qdiv(championship_totals[6], championship_totals[8]), 2
+        )
+        team.championship_run_penalties_score = round(
+            qdiv(championship_totals[7], championship_totals[8]), 2
+        )
+        team.championship_penalties_score = round(
+            team.championship_general_penalties_score
+            + team.championship_run_penalties_score,
+            2,
+        )
         
         # Championship total = machine design + presentation + preliminary journal - total penalties
         journal_score = team.preliminary_journal_score or 0
@@ -236,9 +341,11 @@ def _compute_totals_for_team(team: Teams, contest_id: int = None):
         team.championship_score = team.total_score  # Set championship_score to match total_score for championship rounds
         
     elif is_redesign_round:
-        # Use summed redesign total only (no per-section fields, no averaging)
+        # Redesign is the average of all submitted judges' rubric totals.
         if hasattr(team, '_redesign_total') and team._redesign_judge_count > 0:
-            team.redesign_score = round(team._redesign_total, 2)
+            team.redesign_score = round(
+                qdiv(team._redesign_total, team._redesign_judge_count), 2
+            )
         else:
             team.redesign_score = 0
         team.total_score = team.redesign_score
@@ -256,13 +363,12 @@ def set_team_rank(data):
     for mapping in contest_team_ids:
         try:
             t = Teams.objects.get(id=mapping.teamid)
-            if not t.organizer_disqualified:
-                contestteams.append(t)
+            contestteams.append(t)
         except Teams.DoesNotExist:
             continue
 
     # Sort by preliminary_total_score for preliminary ranking
-    contestteams.sort(key=lambda x: x.preliminary_total_score or 0, reverse=True)
+    contestteams = sort_by_standard_round_tiebreakers(contestteams)
     for rank, team in enumerate(contestteams, start=1):
         team.team_rank = rank
         team.save()
@@ -271,16 +377,20 @@ def set_team_rank(data):
 def set_cluster_rank(data):
     """Set per-cluster rank by total_score for eligible teams."""
     cluster_team_ids = MapClusterToTeam.objects.filter(clusterid=data["clusterid"])
+    if data.get("contestid") is not None:
+        contest_team_ids = MapContestToTeam.objects.filter(
+            contestid=data["contestid"]
+        ).values_list("teamid", flat=True)
+        cluster_team_ids = cluster_team_ids.filter(teamid__in=contest_team_ids)
     clusterteams = []
     for mapping in cluster_team_ids:
         try:
             t = Teams.objects.get(id=mapping.teamid)
-            if not t.organizer_disqualified:
-                clusterteams.append(t)
+            clusterteams.append(t)
         except Teams.DoesNotExist:
             continue
 
-    clusterteams.sort(key=lambda x: x.total_score, reverse=True)
+    clusterteams = sort_by_standard_round_tiebreakers(clusterteams)
     for rank, team in enumerate(clusterteams, start=1):
         team.cluster_rank = rank
         team.save()
@@ -300,13 +410,16 @@ def set_redesign_rank(contest_id):
                 team = Teams.objects.get(id=team_mapping.teamid)
                 # Only include teams from this specific contest
                 contest_mapping = MapContestToTeam.objects.filter(teamid=team.id, contestid=contest_id)
-                if contest_mapping.exists() and not team.organizer_disqualified:
+                if contest_mapping.exists():
                     redesign_teams.append(team)
             except Teams.DoesNotExist:
                 continue
 
     # Sort by redesign_score instead of total_score
-    redesign_teams.sort(key=lambda x: x.redesign_score or 0, reverse=True)
+    # A team should appear only once even if legacy data maps it to more than
+    # one redesign cluster. Stable ID fallback makes ties repeatable.
+    redesign_teams = list({team.id: team for team in redesign_teams}.values())
+    redesign_teams = sort_by_redesign_tiebreakers(redesign_teams, contest_id)
     
     for rank, team in enumerate(redesign_teams, start=1):
         team.team_rank = rank
@@ -320,13 +433,15 @@ def set_championship_rank(contest_id):
     for mapping in contest_team_ids:
         try:
             t = Teams.objects.get(id=mapping.teamid)
-            if not t.organizer_disqualified and t.advanced_to_championship:
+            if t.advanced_to_championship:
                 championship_teams.append(t)
         except Teams.DoesNotExist:
             continue
 
     # Sort championship teams by total_score and set rankings
-    championship_teams.sort(key=lambda x: x.total_score, reverse=True)
+    championship_teams = sort_by_standard_round_tiebreakers(
+        championship_teams, championship=True
+    )
     for rank, team in enumerate(championship_teams, start=1):
         team.championship_rank = rank
         team.save()
@@ -346,28 +461,28 @@ def _ensure_requester_is_organizer_of_contest(user, contest_id: int):
 
 def recompute_totals_and_ranks(contest_id: int):
     """Recompute all teams' totals for a contest, then reapply cluster & contest ranks."""
-    contest_team_ids = MapContestToTeam.objects.filter(contestid=contest_id)
-    teams = []
-    for m in contest_team_ids:
-        try:
-            teams.append(Teams.objects.get(id=m.teamid))
-        except Teams.DoesNotExist:
-            continue
+    with transaction.atomic():
+        # Lock the contest and its teams in a stable order. Concurrent score
+        # submissions then wait instead of interleaving totals and rankings.
+        Contest.objects.select_for_update().get(id=contest_id)
+        team_ids = list(
+            MapContestToTeam.objects.filter(contestid=contest_id)
+            .order_by("teamid")
+            .values_list("teamid", flat=True)
+        )
+        teams = list(
+            Teams.objects.select_for_update().filter(id__in=team_ids).order_by("id")
+        )
 
-    # Compute totals and save all teams in one batch operation
-    for t in teams:
-        _compute_totals_for_team(t, contest_id)
-        t.save()  # Save each team after computation
+        for team in teams:
+            _compute_totals_for_team(team, contest_id)
+            team.save()
 
-    for m in MapContestToCluster.objects.filter(contestid=contest_id):
-        set_cluster_rank({"clusterid": m.clusterid})
-    set_team_rank({"contestid": contest_id})
-
-    # Set championship rankings for teams in championship clusters
-    set_championship_rank(contest_id)
-
-    # Set redesign rankings for redesign teams only
-    set_redesign_rank(contest_id)
+        for mapping in MapContestToCluster.objects.filter(contestid=contest_id):
+            set_cluster_rank({"clusterid": mapping.clusterid, "contestid": contest_id})
+        set_team_rank({"contestid": contest_id})
+        set_championship_rank(contest_id)
+        set_redesign_rank(contest_id)
 
 
 # ---------- Endpoints ----------
@@ -375,6 +490,7 @@ def recompute_totals_and_ranks(contest_id: int):
 @api_view(["PUT"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def tabulate_scores(request):
     """Recompute totals and ranks for all teams."""
     contest_id = request.data.get("contestid")
@@ -389,8 +505,13 @@ def tabulate_scores(request):
     try:
         recompute_totals_and_ranks(contest_id)
         return Response(status=200)
-    except Exception as e:
-        return Response({"error": str(e)}, status=500)
+    except Exception:
+        transaction.set_rollback(True)
+        logger.exception("Could not tabulate scores for contest %s", contest_id)
+        return Response(
+            {"detail": "Could not update contest results. No changes were saved; please try again or contact support."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 @api_view(["PUT"])
 @authentication_classes([SessionAuthentication])
@@ -415,6 +536,9 @@ def preliminary_results(request):
     recompute_totals_and_ranks(contest_id)
 
     response_clusters = []
+    contest_team_ids = MapContestToTeam.objects.filter(
+        contestid=contest_id
+    ).values_list("teamid", flat=True)
     for cm in MapContestToCluster.objects.filter(contestid=contest_id):
         # Every contest receives an internal "All Teams" cluster at creation.
         # It is useful for setup, but its members are also assigned to their
@@ -425,7 +549,10 @@ def preliminary_results(request):
             continue
 
         # teams in this cluster
-        team_maps = MapClusterToTeam.objects.filter(clusterid=cm.clusterid)
+        team_maps = MapClusterToTeam.objects.filter(
+            clusterid=cm.clusterid,
+            teamid__in=contest_team_ids,
+        )
         cluster_teams = []
         for m in team_maps:
             try:
@@ -433,7 +560,7 @@ def preliminary_results(request):
             except Teams.DoesNotExist:
                 continue
 
-        ordered = sort_by_score_with_id_fallback(cluster_teams, "total_score")
+        ordered = sort_by_standard_round_tiebreakers(cluster_teams)
         response_clusters.append({
             "cluster_id": cm.clusterid,
             "teams": [
@@ -485,10 +612,28 @@ def set_advancers(request):
         MapContestToTeam.objects.filter(contestid=contest_id).values_list("teamid", flat=True)
     )
 
-    # reset everyone in contest
+    # Validate the complete request before changing existing advancement choices.
+    disqualified_ids = set(Teams.objects.filter(
+        id__in=contest_team_ids
+    ).filter(
+        Q(judge_disqualified=True) | Q(organizer_disqualified=True)
+    ).values_list("id", flat=True))
+    invalid_disqualified = [tid for tid in team_ids if tid in disqualified_ids]
+    if invalid_disqualified:
+        return Response(
+            {
+                "ok": False,
+                "message": "Disqualified teams cannot advance to the championship round.",
+                "team_ids": invalid_disqualified,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # Reset only after validation, so a rejected request cannot erase the
+    # contest's existing advancers.
     Teams.objects.filter(id__in=contest_team_ids).update(advanced_to_championship=False, championship_rank=None)
 
-    # set selected advancers (intersection safety)
+    # Set selected advancers (intersection safety).
     valid_selection = [tid for tid in team_ids if tid in contest_team_ids]
     Teams.objects.filter(id__in=valid_selection).update(advanced_to_championship=True)
 
@@ -542,10 +687,13 @@ def championship_results(request):
     
     #get championship results
     team_ids = MapContestToTeam.objects.filter(contestid=contest_id).values_list("teamid", flat=True)
-    championship_teams = Teams.objects.filter(
+    championship_teams = list(Teams.objects.filter(
         id__in=list(team_ids),
         advanced_to_championship=True
-    ).order_by('-total_score', 'id')
+    ))
+    championship_teams = sort_by_standard_round_tiebreakers(
+        championship_teams, championship=True
+    )
 
     results = []
     for i, team in enumerate(championship_teams, 1):
@@ -590,9 +738,10 @@ def redesign_results(request):
     team_ids = MapClusterToTeam.objects.filter(
         clusterid__in=redesign_cluster_ids
     ).values_list("teamid", flat=True)
-    redesign_teams = Teams.objects.filter(
+    redesign_teams = list(Teams.objects.filter(
         id__in=list(team_ids)
-    ).distinct().order_by('-redesign_score', 'id')
+    ).distinct())
+    redesign_teams = sort_by_redesign_tiebreakers(redesign_teams, contest_id)
 
     results = []
     for i, team in enumerate(redesign_teams, 1):
