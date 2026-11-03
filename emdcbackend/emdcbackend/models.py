@@ -7,6 +7,7 @@ class Contest(models.Model):
     date = models.DateField()
     is_open = models.BooleanField()
     is_tabulated = models.BooleanField()
+    results_published = models.BooleanField(default=False)
 
     def __str__(self):
         return f"{self.id} - {self.name}"
@@ -268,6 +269,35 @@ class Scoresheet(models.Model):
             for field in required_fields:
                 if getattr(self, field) is None:
                     raise ModelValidationError({field: f'{field.capitalize()} is required.'})
+
+        rubric_limits = {
+            ScoresheetEnum.PRESENTATION: [5, 5, 5, 5, 5, 5, 10, 10],
+            ScoresheetEnum.JOURNAL: [5, 5, 5, 5, 10, 10, 5, 5],
+            ScoresheetEnum.MACHINEDESIGN: [20, 20, 20, 20, 20, 20, 15, 15],
+            ScoresheetEnum.REDESIGN: [20, 20, 20, 15, 15, 20, 20],
+        }
+        limits = rubric_limits.get(self.sheetType)
+        if self.sheetType == ScoresheetEnum.CHAMPIONSHIP:
+            limits = rubric_limits[ScoresheetEnum.MACHINEDESIGN] + rubric_limits[ScoresheetEnum.PRESENTATION]
+            field_numbers = list(range(1, 9)) + list(range(10, 18))
+        else:
+            field_numbers = list(range(1, len(limits) + 1)) if limits else []
+
+        errors = {}
+        for field_number, maximum in zip(field_numbers, limits or []):
+            field_name = f"field{field_number}"
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError):
+                errors[field_name] = "Score must be a number."
+                continue
+            if numeric_value < 0 or numeric_value > maximum:
+                errors[field_name] = f"Score must be between 0 and {maximum}."
+        if errors:
+            raise ModelValidationError(errors)
 
     def save(self, *args, **kwargs):
         # Only run validation if the scoresheet is being submitted (not just saved as draft)

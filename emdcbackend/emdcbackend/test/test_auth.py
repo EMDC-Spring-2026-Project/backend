@@ -4,6 +4,7 @@ from rest_framework.test import APITestCase
 from django.contrib.auth.models import User
 from ..models import Admin, MapUserToRole
 from ..serializers import AdminSerializer
+from unittest.mock import patch
 
 class UserAuthTests(APITestCase):
 
@@ -63,6 +64,21 @@ class UserAuthTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         # Session authentication doesn't return token, check for user instead
         self.assertIn('user', response.data)
+
+    def test_signup_hides_unexpected_server_errors(self):
+        self.client.force_authenticate(user=self.user)
+        with self.assertLogs("emdcbackend.auth.views", level="ERROR"):
+            with patch(
+                "emdcbackend.auth.views.create_user",
+                side_effect=RuntimeError("sensitive database detail"),
+            ):
+                response = self.client.post(reverse("signup"), {
+                    "username": "failure@example.com",
+                    "password": "NewPassword123!",
+                })
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("sensitive database detail", str(response.data))
 
     def test_signup_requires_an_administrator(self):
         self.client.force_authenticate(user=None)

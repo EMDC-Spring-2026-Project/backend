@@ -379,8 +379,8 @@ class ComputeTotalsForTeamTests(TestCase):
         presentation_sheet = Scoresheet.objects.create(
             sheetType=ScoresheetEnum.PRESENTATION,
             isSubmitted=True,
-            field1=10.0, field2=10.0, field3=10.0, field4=10.0,
-            field5=10.0, field6=10.0, field7=10.0, field8=10.0
+            field1=5.0, field2=5.0, field3=5.0, field4=5.0,
+            field5=5.0, field6=5.0, field7=10.0, field8=10.0
         )
         MapScoresheetToTeamJudge.objects.create(
             teamid=team.id,
@@ -392,9 +392,9 @@ class ComputeTotalsForTeamTests(TestCase):
         _compute_totals_for_team(team)
         team.refresh_from_db()
         
-        # Presentation score should be 80.0 (sum of 8 fields = 80, divided by 1 judge)
-        self.assertEqual(team.presentation_score, 80.0)
-        self.assertEqual(team.preliminary_presentation_score, 80.0)
+        # Presentation score is the submitted judge's rubric total.
+        self.assertEqual(team.presentation_score, 50.0)
+        self.assertEqual(team.preliminary_presentation_score, 50.0)
     
     def test_compute_totals_with_penalties(self):
         """Test computing totals with penalty scoresheets"""
@@ -488,8 +488,8 @@ class ComputeTotalsForTeamTests(TestCase):
             isSubmitted=True,
             field1=10.0, field2=10.0, field3=10.0, field4=10.0,  # Machine Design (fields 1-8)
             field5=10.0, field6=10.0, field7=10.0, field8=10.0,
-            field10=15.0, field11=15.0, field12=15.0, field13=15.0,  # Presentation (fields 10-17)
-            field14=15.0, field15=15.0, field16=15.0, field17=15.0
+            field10=5.0, field11=5.0, field12=5.0, field13=5.0,  # Presentation (fields 10-17)
+            field14=5.0, field15=5.0, field16=10.0, field17=10.0
         )
         MapScoresheetToTeamJudge.objects.create(
             teamid=team.id,
@@ -503,11 +503,11 @@ class ComputeTotalsForTeamTests(TestCase):
         
         # Championship scores should be calculated
         self.assertEqual(team.championship_machinedesign_score, 80.0)  # 8 fields * 10 = 80
-        self.assertEqual(team.championship_presentation_score, 120.0)  # 8 fields * 15 = 120
-        # Total = journal (90) + machine design (80) + presentation (120) - penalties (0) = 290
+        self.assertEqual(team.championship_presentation_score, 50.0)
+        # Total = journal (90) + machine design (80) + presentation (50) - penalties (0) = 220
         # But preliminary scores are also calculated, so check championship score specifically
         self.assertGreaterEqual(team.championship_machinedesign_score, 80.0)
-        self.assertGreaterEqual(team.championship_presentation_score, 120.0)
+        self.assertGreaterEqual(team.championship_presentation_score, 50.0)
     
     def test_compute_totals_redesign_round(self):
         """Test computing totals for redesign round"""
@@ -547,7 +547,7 @@ class ComputeTotalsForTeamTests(TestCase):
             sheetType=ScoresheetEnum.REDESIGN,
             isSubmitted=True,
             field1=20.0, field2=20.0, field3=20.0,
-            field4=20.0, field5=20.0, field6=20.0, field7=0.0
+            field4=15.0, field5=15.0, field6=20.0, field7=0.0
         )
         MapScoresheetToTeamJudge.objects.create(
             teamid=team.id,
@@ -559,9 +559,9 @@ class ComputeTotalsForTeamTests(TestCase):
         _compute_totals_for_team(team)
         team.refresh_from_db()
         
-        # Redesign score should be sum of all fields (120.0)
-        self.assertEqual(team.redesign_score, 120.0)
-        self.assertEqual(team.total_score, 120.0)
+        # Redesign score should be the valid rubric total.
+        self.assertEqual(team.redesign_score, 110.0)
+        self.assertEqual(team.total_score, 110.0)
     
     def test_compute_totals_unsubmitted_scoresheets(self):
         """Test that unsubmitted scoresheets are not counted"""

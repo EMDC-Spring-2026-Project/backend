@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework import status
 from rest_framework.decorators import (
     api_view,
@@ -15,6 +17,8 @@ from ..models import JudgeClusters, MapContestToCluster, MapContestToOrganizer, 
 from ..serializers import JudgeClustersSerializer
 from .Maps.MapClusterToContest import  map_cluster_to_contest
 from ..models import Teams, MapClusterToTeam
+
+logger = logging.getLogger(__name__)
 
 
 def _can_manage_contest(user, contest_id):
@@ -91,8 +95,12 @@ def create_cluster(request):
   except ValidationError as e:  # Catching ValidationErrors specifically
     return Response({"errors": e.detail}, status=status.HTTP_400_BAD_REQUEST)
   
-  except Exception as e:
-    return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+  except Exception:
+    logger.exception("Unexpected error while creating cluster")
+    return Response(
+      {"detail": "Unable to create cluster due to an unexpected server error."},
+      status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    )
 
 
 @api_view(["POST"])
@@ -152,8 +160,12 @@ def delete_cluster(request, cluster_id):
             return Response({"detail": "Cluster and all associated mappings deleted successfully."}, status=status.HTTP_200_OK)
     except Http404:
         return Response({"detail": "Cluster not found."}, status=status.HTTP_404_NOT_FOUND)
-    except Exception as e:
-        return Response({"detail": f"Error deleting cluster: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while deleting cluster %s", cluster_id)
+        return Response(
+            {"detail": "Unable to delete cluster due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 def make_judge_cluster_instance(data):

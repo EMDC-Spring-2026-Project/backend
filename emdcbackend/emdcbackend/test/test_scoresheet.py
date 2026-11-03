@@ -1,12 +1,12 @@
 from django.urls import reverse
-from rest_framework.test import APITestCase
+from rest_framework.test import APITestCase, APIRequestFactory, force_authenticate
 from rest_framework import status
 from django.contrib.auth.models import User
 from unittest.mock import patch
 from ..models import (
     Scoresheet, ScoresheetEnum, Teams, Judge, MapScoresheetToTeamJudge,
     Admin, MapUserToRole, MapContestToJudge, JudgeClusters, MapJudgeToCluster,
-    MapContestToCluster, MapContestToTeam,
+    MapContestToCluster, MapContestToTeam, MapClusterToTeam,
 )
 from ..serializers import ScoresheetSerializer
 
@@ -52,6 +52,104 @@ class ScoresheetAPITests(APITestCase):
             journal=True
         )
 
+    def test_judge_cannot_change_scores_after_contest_closes(self):
+        judge_user = User.objects.create_user(
+            username="closed-contest-judge@example.com", password="password"
+        )
+        MapUserToRole.objects.create(uuid=judge_user.id, role=3, relatedid=self.judge.id)
+        MapContestToJudge.objects.create(contestid=self.contest.id, judgeid=self.judge.id)
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=self.team.id)
+        self.contest.is_open = False
+        self.contest.save()
+        self.client.force_authenticate(user=judge_user)
+
+        requests = (
+            ("edit_score_sheets", "post", {"field1": 99, "isSubmitted": False}),
+            ("update_scores", "post", {"field1": 99, "isSubmitted": False}),
+            ("edit_score_sheet_field", "post", {"field": "field1", "new_value": 99}),
+            ("delete_score_sheets", "delete", {}),
+        )
+        for endpoint, method, payload in requests:
+            with self.subTest(endpoint=endpoint):
+                sheet = Scoresheet.objects.create(
+                    sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=True,
+                    **{f"field{number}": 1.0 for number in range(1, 9)},
+                )
+                MapScoresheetToTeamJudge.objects.create(
+                    teamid=self.team.id, judgeid=self.judge.id,
+                    scoresheetid=sheet.id, sheetType=ScoresheetEnum.PRESENTATION,
+                )
+                data = {"id": sheet.id, **payload}
+                url = reverse(endpoint, args=[sheet.id]) if method == "delete" else reverse(endpoint)
+                response = getattr(self.client, method)(url, data, format="json")
+                self.assertEqual(response.status_code, status.HTTP_409_CONFLICT, response.data)
+                sheet.refresh_from_db()
+                self.assertEqual(sheet.field1, 1)
+                self.assertTrue(sheet.isSubmitted)
+
+    def test_submitted_shared_team_recalculates_every_contest(self):
+        from datetime import date
+        from ..views.scoresheets import _schedule_tabulation_for_team
+        from ..models import Contest
+
+        other_contest = Contest.objects.create(
+            name="Shared Team Contest", date=date.today(), is_open=True,
+            is_tabulated=False,
+        )
+        MapContestToTeam.objects.create(
+            contestid=self.contest.id, teamid=self.team.id
+        )
+        MapContestToTeam.objects.create(
+            contestid=other_contest.id, teamid=self.team.id
+        )
+
+        class ImmediateThread:
+            def __init__(self, target, daemon):
+                self.target = target
+                self.daemon = daemon
+
+            def start(self):
+                self.target()
+
+        with patch("emdcbackend.views.scoresheets.threading.Thread", ImmediateThread):
+            with patch(
+                "emdcbackend.views.tabulation.recompute_totals_and_ranks"
+            ) as recompute:
+                _schedule_tabulation_for_team(self.team.id)
+
+        recalculated_ids = {call.args[0] for call in recompute.call_args_list}
+        self.assertEqual(recalculated_ids, {self.contest.id, other_contest.id})
+
+    def test_missing_championship_sheets_is_admin_only(self):
+        from ..views.scoresheets import create_missing_championship_scoresheets
+
+        ordinary_user = User.objects.create_user(
+            username="ordinary-scoresheet-user@example.com", password="testpassword"
+        )
+        request = APIRequestFactory().post(
+            "/internal/create-missing-championship-scoresheets/",
+            {"judge_id": self.judge.id},
+            format="json",
+        )
+        force_authenticate(request, user=ordinary_user)
+        response = create_missing_championship_scoresheets(request)
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_missing_championship_sheets_rejects_invalid_judge_ids(self):
+        from ..views.scoresheets import create_missing_championship_scoresheets
+
+        for invalid_id in (None, True, 0, -1, "1.2", "not-an-id"):
+            with self.subTest(judge_id=invalid_id):
+                request = APIRequestFactory().post(
+                    "/internal/create-missing-championship-scoresheets/",
+                    {"judge_id": invalid_id},
+                    format="json",
+                )
+                force_authenticate(request, user=self.user)
+                response = create_missing_championship_scoresheets(request)
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
     def test_scores_by_id(self):
         scoresheet = Scoresheet.objects.create(
             sheetType=ScoresheetEnum.PRESENTATION,
@@ -61,7 +159,7 @@ class ScoresheetAPITests(APITestCase):
             field3=3.0,
             field4=4.0,
             field5=5.0,
-            field6=6.0,
+            field6=5.0,
             field7=7.0,
             field8=8.0
         )
@@ -79,6 +177,40 @@ class ScoresheetAPITests(APITestCase):
         response = self.client.get(reverse('scores_by_id', args=[scoresheet.id]))
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_removing_judge_from_one_cluster_keeps_scoresheet_needed_by_another(self):
+        from ..views.scoresheets import delete_sheets_for_teams_in_cluster
+
+        team = self.team
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=team.id)
+        target_cluster = JudgeClusters.objects.create(cluster_name="Target Cluster")
+        remaining_cluster = JudgeClusters.objects.create(cluster_name="Remaining Cluster")
+        MapContestToCluster.objects.create(
+            contestid=self.contest.id, clusterid=target_cluster.id
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.contest.id, clusterid=remaining_cluster.id
+        )
+        MapClusterToTeam.objects.create(clusterid=target_cluster.id, teamid=team.id)
+        MapClusterToTeam.objects.create(clusterid=remaining_cluster.id, teamid=team.id)
+        MapJudgeToCluster.objects.create(
+            judgeid=self.judge.id, clusterid=remaining_cluster.id,
+            contestid=self.contest.id,
+        )
+        sheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=False
+        )
+        mapping = MapScoresheetToTeamJudge.objects.create(
+            teamid=team.id, judgeid=self.judge.id, scoresheetid=sheet.id,
+            sheetType=ScoresheetEnum.PRESENTATION,
+        )
+
+        delete_sheets_for_teams_in_cluster(
+            self.judge.id, target_cluster.id, True, False, False, False, False, False, False
+        )
+
+        self.assertTrue(MapScoresheetToTeamJudge.objects.filter(id=mapping.id).exists())
+        self.assertTrue(Scoresheet.objects.filter(id=sheet.id).exists())
 
     def test_create_score_sheet(self):
         url = reverse('create_score_sheets')
@@ -228,27 +360,27 @@ class ScoresheetAPITests(APITestCase):
             "id": scoresheet.id,
             "sheetType": ScoresheetEnum.PRESENTATION,
             "isSubmitted": True,
-            "field1": 10.0,
-            "field2": 20.0,
-            "field3": 30.0,
-            "field4": 40.0,
-            "field5": 50.0,
-            "field6": 60.0,
-            "field7": 70.0,
-            "field8": 80.0
+            "field1": 1.0,
+            "field2": 2.0,
+            "field3": 3.0,
+            "field4": 4.0,
+            "field5": 5.0,
+            "field6": 5.0,
+            "field7": 7.0,
+            "field8": 8.0
         }
         response = self.client.post(url, data)
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         scoresheet.refresh_from_db()
         self.assertTrue(scoresheet.isSubmitted)
-        self.assertEqual(scoresheet.field1, 10.0)
-        self.assertEqual(scoresheet.field8, 80.0)
+        self.assertEqual(scoresheet.field1, 1.0)
+        self.assertEqual(scoresheet.field8, 8.0)
 
     def test_submit_score_sheet_preserves_omitted_fields(self):
         scoresheet = Scoresheet.objects.create(
             sheetType=ScoresheetEnum.PRESENTATION,
             isSubmitted=False,
-            **{f"field{number}": float(number) for number in range(1, 9)},
+            **{f"field{number}": 1.0 for number in range(1, 9)},
         )
 
         response = self.client.post(
@@ -265,7 +397,23 @@ class ScoresheetAPITests(APITestCase):
         scoresheet.refresh_from_db()
         self.assertTrue(scoresheet.isSubmitted)
         self.assertEqual(scoresheet.field1, 1.0)
-        self.assertEqual(scoresheet.field8, 8.0)
+        self.assertEqual(scoresheet.field8, 1.0)
+
+    def test_update_scores_hides_internal_errors(self):
+        sheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=False
+        )
+
+        with patch.object(Scoresheet, "save", side_effect=RuntimeError("private database detail")):
+            response = self.client.post(
+                reverse("update_scores"),
+                {"id": sheet.id, "field1": 4},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("private database detail", str(response.data))
+        self.assertEqual(response.data["error"], "Unable to update the scoresheet.")
 
     def test_edit_score_sheet_returns_not_found_for_missing_sheet(self):
         response = self.client.post(
@@ -365,7 +513,7 @@ class ScoresheetAPITests(APITestCase):
     def test_edit_score_sheet_field_parses_false_string_as_false(self):
         scoresheet = Scoresheet.objects.create(
             sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=True,
-            **{f"field{number}": float(number) for number in range(1, 9)},
+            **{f"field{number}": 1.0 for number in range(1, 9)},
         )
 
         response = self.client.post(
@@ -388,24 +536,39 @@ class ScoresheetAPITests(APITestCase):
             field3=3.0,
             field4=4.0,
             field5=5.0,
-            field6=6.0,
+            field6=5.0,
             field7=7.0,
             field8=8.0
         )
         url = reverse('update_scores')
         data = {
             "id": scoresheet.id,
-            "field1": 10.0,
-            "field2": 20.0,
-            "field3": 30.0,
+            "field1": 2.0,
+            "field2": 3.0,
+            "field3": 4.0,
             "isSubmitted": True
         }
         response = self.client.post(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         scoresheet.refresh_from_db()
         self.assertTrue(scoresheet.isSubmitted)
-        self.assertEqual(scoresheet.field1, 10.0)
-        self.assertEqual(scoresheet.field3, 30.0)
+        self.assertEqual(scoresheet.field1, 2.0)
+        self.assertEqual(scoresheet.field3, 4.0)
+
+    def test_submitted_score_rejects_values_above_rubric_limit(self):
+        scoresheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=False,
+            **{f"field{number}": 1.0 for number in range(1, 9)},
+        )
+        response = self.client.post(
+            reverse("update_scores"),
+            {"id": scoresheet.id, "field1": 200, "isSubmitted": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        scoresheet.refresh_from_db()
+        self.assertFalse(scoresheet.isSubmitted)
+        self.assertEqual(scoresheet.field1, 1)
 
     def test_update_scores_preserves_omitted_fields(self):
         scoresheet = Scoresheet.objects.create(
@@ -595,6 +758,55 @@ class ScoresheetAPITests(APITestCase):
         response = self.client.get(url, data={"contestid": self.contest.id}, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertIn(self.team.id, response.data["teams"])
+        self.assertEqual(
+            response.data["teams"][self.team.id][str(ScoresheetEnum.PRESENTATION)]["1"],
+            [1.0],
+        )
+
+    def test_contest_score_details_exclude_scores_from_other_contest_judges_on_shared_cluster(self):
+        from datetime import date
+        from ..models import Contest
+
+        other_contest = Contest.objects.create(
+            name="Other Score Details Contest", date=date.today(), is_open=True,
+            is_tabulated=False,
+        )
+        other_judge = Judge.objects.create(
+            first_name="Other", last_name="Judge", phone_number="5555555555",
+            contestid=other_contest.id,
+        )
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=self.team.id)
+        shared_cluster = JudgeClusters.objects.create(
+            cluster_name="Shared Score Details Cluster", cluster_type="preliminary"
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.contest.id, clusterid=shared_cluster.id
+        )
+        MapContestToCluster.objects.create(
+            contestid=other_contest.id, clusterid=shared_cluster.id
+        )
+        MapJudgeToCluster.objects.create(
+            judgeid=self.judge.id, clusterid=shared_cluster.id, contestid=self.contest.id
+        )
+        MapJudgeToCluster.objects.create(
+            judgeid=other_judge.id, clusterid=shared_cluster.id, contestid=other_contest.id
+        )
+
+        for judge, field1 in ((self.judge, 1.0), (other_judge, 9.0)):
+            sheet = Scoresheet.objects.create(
+                sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=False, field1=field1
+            )
+            MapScoresheetToTeamJudge.objects.create(
+                teamid=self.team.id, judgeid=judge.id, scoresheetid=sheet.id,
+                sheetType=ScoresheetEnum.PRESENTATION,
+            )
+
+        response = self.client.get(
+            reverse('get_scoresheet_details_for_contest'),
+            data={"contestid": self.contest.id}, format='json'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(
             response.data["teams"][self.team.id][str(ScoresheetEnum.PRESENTATION)]["1"],
             [1.0],

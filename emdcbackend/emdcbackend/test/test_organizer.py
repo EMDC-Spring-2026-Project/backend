@@ -7,6 +7,7 @@ from ..models import (
 )
 from django.contrib.auth import get_user_model
 from ..serializers import OrganizerSerializer  # Assuming you have a serializer for Organizer
+from unittest.mock import patch
 
 User = get_user_model()
 
@@ -57,6 +58,28 @@ class OrganizerAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data['organizer']['first_name'], "New")
 
+    @patch("emdcbackend.views.organizer.create_user_role_map", side_effect=RuntimeError("sensitive database detail"))
+    def test_create_organizer_hides_errors_and_rolls_back(self, _mock_mapping):
+        self.authenticate_admin()
+        initial_counts = (Organizer.objects.count(), User.objects.count())
+        response = self.client.post(
+            reverse('create_organizer'),
+            {
+                "username": "failed-organizer@example.com",
+                "password": "password",
+                "first_name": "Failed",
+                "last_name": "Organizer",
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(
+            response.data["detail"],
+            "Unable to create the organizer due to an unexpected server error.",
+        )
+        self.assertNotIn("sensitive database detail", str(response.data))
+        self.assertEqual((Organizer.objects.count(), User.objects.count()), initial_counts)
+
     def test_edit_organizer(self):
         url = reverse('edit_organizer')  # Pass the organizer ID
         data = {
@@ -82,6 +105,20 @@ class OrganizerAPITests(APITestCase):
         self.assertEqual(self.organizer.last_name, "User")
         self.assertEqual(self.user.username, "partial@example.com")
 
+    def test_edit_organizer_hides_unexpected_server_errors(self):
+        with patch.object(Organizer, "save", side_effect=RuntimeError("sensitive database detail")):
+            response = self.client.post(
+                reverse('edit_organizer'),
+                {"id": self.organizer.id, "first_name": "Updated"},
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(
+            response.data["detail"],
+            "Unable to update organizer due to an unexpected server error.",
+        )
+        self.assertNotIn("sensitive database detail", str(response.data))
+
     def test_delete_organizer(self):
         self.authenticate_admin()
         url = reverse('delete_organizer', args=[self.organizer.id])
@@ -96,6 +133,25 @@ class OrganizerAPITests(APITestCase):
         response = self.client.delete(reverse('delete_organizer', args=[999999]))
 
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @patch.object(Organizer, "delete", side_effect=RuntimeError("sensitive database detail"))
+    def test_delete_organizer_hides_errors_and_rolls_back(self, _mock_delete):
+        self.authenticate_admin()
+        response = self.client.delete(reverse('delete_organizer', args=[self.organizer.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(
+            response.data["detail"],
+            "Unable to delete the organizer due to an unexpected server error.",
+        )
+        self.assertNotIn("sensitive database detail", str(response.data))
+        self.assertTrue(Organizer.objects.filter(id=self.organizer.id).exists())
+        self.assertTrue(User.objects.filter(id=self.user.id).exists())
+        self.assertTrue(
+            MapUserToRole.objects.filter(
+                uuid=self.user.id, relatedid=self.organizer.id
+            ).exists()
+        )
 
     def test_non_admin_cannot_create_or_delete_organizers(self):
         create_response = self.client.post(
@@ -176,9 +232,9 @@ class OrganizerAPITests(APITestCase):
         url = reverse('organizer_disqualify_team')
         data = {"teamid": team.id, "organizer_disqualified": True}
         response = self.client.post(url, data, format='json', **self.get_auth_headers())
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         team.refresh_from_db()
-        self.assertTrue(team.organizer_disqualified)
+        self.assertFalse(team.organizer_disqualified)
 
     def test_full_disqualification_handles_stale_scoresheet_mapping(self):
         team = Teams.objects.create(
@@ -213,13 +269,13 @@ class OrganizerAPITests(APITestCase):
             format='json',
         )
 
-        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
         team.refresh_from_db()
         scoresheet.refresh_from_db()
-        self.assertTrue(team.organizer_disqualified)
-        self.assertIsNone(team.team_rank)
-        self.assertIsNone(team.cluster_rank)
-        self.assertTrue(scoresheet.isSubmitted)
+        self.assertFalse(team.organizer_disqualified)
+        self.assertEqual(team.team_rank, 2)
+        self.assertEqual(team.cluster_rank, 1)
+        self.assertFalse(scoresheet.isSubmitted)
 
     def test_unassigned_organizer_cannot_disqualify_team(self):
         team = Teams.objects.create(team_name="Protected Team")

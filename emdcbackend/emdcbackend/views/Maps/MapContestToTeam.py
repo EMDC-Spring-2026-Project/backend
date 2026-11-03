@@ -1,4 +1,5 @@
-from django.core.exceptions import FieldError
+import logging
+
 from rest_framework import status
 from rest_framework.decorators import (
     api_view,
@@ -12,6 +13,8 @@ from rest_framework.permissions import IsAuthenticated, AllowAny
 from django.shortcuts import get_object_or_404
 from ...models import MapContestToTeam, Contest, Teams, MapContestToOrganizer, MapUserToRole
 from ...serializers import MapContestToTeamSerializer, ContestSerializer, TeamSerializer
+
+logger = logging.getLogger(__name__)
 
 
 def _can_manage_contest(user, contest_id):
@@ -44,34 +47,83 @@ def create_contest_team_mapping(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([AllowAny])
 def get_teams_by_contest_id(request, contest_id):
+    contest = get_object_or_404(Contest, id=contest_id)
     try:
-        # Ensure all team scores are up-to-date by running tabulation
-        from ...views.tabulation import recompute_totals_and_ranks
+        results_are_final = contest.results_published
 
-        recompute_totals_and_ranks(contest_id)
+        # Finalized scores are calculated when the organizer closes the contest.
+        # Keep this public read endpoint fast; recalculating every score and rank
+        # on each results-page visit can time out for larger contests.
 
         mappings = MapContestToTeam.objects.filter(contestid=contest_id)
         team_ids = mappings.values_list("teamid", flat=True)
         teams = Teams.objects.filter(id__in=team_ids).order_by("team_rank")
         serializer = TeamSerializer(teams, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        team_data = serializer.data
+        if not results_are_final:
+            score_fields = (
+                "journal_score",
+                "presentation_score",
+                "machinedesign_score",
+                "penalties_score",
+                "redesign_score",
+                "total_score",
+                "championship_score",
+                "preliminary_presentation_score",
+                "preliminary_journal_score",
+                "preliminary_machinedesign_score",
+                "preliminary_penalties_score",
+                "preliminary_total_score",
+                "championship_presentation_score",
+                "championship_machinedesign_score",
+                "championship_penalties_score",
+                "championship_general_penalties_score",
+                "championship_run_penalties_score",
+            )
+            rank_fields = ("team_rank", "cluster_rank", "championship_rank")
+            for team in team_data:
+                for field in score_fields:
+                    team[field] = 0
+                for field in rank_fields:
+                    team[field] = None
+                team["advanced_to_championship"] = False
+                team["judge_disqualified"] = False
+                team["organizer_disqualified"] = False
+
+        return Response(team_data, status=status.HTTP_200_OK)
+    except Exception:
+        logger.exception("Failed to load results for contest %s", contest_id)
+        return Response(
+            {"error": "Unable to load contest results."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 @api_view(["GET"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def get_contest_id_by_team_id(request,team_id):
   try:
-    map = MapContestToTeam.objects.get(teamid=team_id)
-    contest_id=map.contestid
-    contest=Contest.objects.get(id=contest_id)
-    serializer = ContestSerializer(instance=contest)
-    return Response({"Contest":serializer.data},status=status.HTTP_200_OK)
+    contest_ids = MapContestToTeam.objects.filter(
+      teamid=team_id
+    ).values_list("contestid", flat=True).distinct()
+    contests = Contest.objects.filter(id__in=contest_ids).order_by("id")
+    contest_data = ContestSerializer(contests, many=True).data
+    if not contest_data:
+      return Response({"error": "No Contest Found for given Team"}, status=status.HTTP_404_NOT_FOUND)
+    # Keep the legacy singular field while also returning every contest for
+    # teams that participate in more than one contest.
+    return Response(
+      {"Contest": contest_data[0], "Contests": contest_data},
+      status=status.HTTP_200_OK,
+    )
   except MapContestToTeam.DoesNotExist:
     return Response({"error": "No Contest Found for given Team"}, status=status.HTTP_404_NOT_FOUND)
-  except Exception as e:
-    return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+  except Exception:
+    logger.exception("Unexpected error while loading contest for team %s", team_id)
+    return Response(
+        {"error": "Unable to load the team's contest due to a server error."},
+        status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    )
 
 
 @api_view(["POST"])
@@ -108,9 +160,12 @@ def get_contests_by_team_ids(request):
 
         return Response(result, status=status.HTTP_200_OK)
 
-    except Exception as e:
-        # General exception handling
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading contests for teams")
+        return Response(
+            {"error": "Unable to load team contests due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 @api_view(["DELETE"])

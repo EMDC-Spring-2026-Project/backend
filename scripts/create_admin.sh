@@ -1,25 +1,30 @@
 #!/bin/bash
 # Script to create an admin account in Docker
-# Usage: ./create_admin.sh [username] [password] [first_name] [last_name]
+# Usage: ./create_admin.sh [username] [first_name] [last_name]
 
-set -e
+set -euo pipefail
 
 cd /backend
 
-USERNAME=${1:-"admin@example.com"}
-PASSWORD=${2:-"admin123"}
-FIRST_NAME=${3:-"Admin"}
-LAST_NAME=${4:-"User"}
+if (( $# > 3 )); then
+    echo "Usage: $0 [username] [first_name] [last_name]" >&2
+    exit 2
+fi
+
+USERNAME=${1:-}
+FIRST_NAME=${2:-"Admin"}
+LAST_NAME=${3:-"User"}
 
 echo "Creating admin account..."
-echo "Username: $USERNAME"
 echo "Name: $FIRST_NAME $LAST_NAME"
 
-python manage.py create_first_admin \
-    --username "$USERNAME" \
-    --password "$PASSWORD" \
+COMMAND=(python manage.py create_first_admin)
+if [[ -n "$USERNAME" ]]; then
+    COMMAND+=(--username "$USERNAME")
+fi
+"${COMMAND[@]}" \
     --first-name "$FIRST_NAME" \
     --last-name "$LAST_NAME"
 
-echo "✓ Admin account created successfully!"
+echo "✓ Admin account command completed."
 

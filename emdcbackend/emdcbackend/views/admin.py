@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework import status
 from rest_framework.decorators import (
     api_view,
@@ -18,6 +20,9 @@ from ..auth.views import delete_user
 from .Maps.MapUserToRole import create_user_role_map
 from ..models import MapUserToRole
 from ..auth.views import User, delete_user_by_id
+
+
+logger = logging.getLogger(__name__)
 
 
 def _is_admin(user):
@@ -100,8 +105,12 @@ def create_admin(request):
     except ValidationError as e:  # Catching ValidationErrors specifically
         return Response({"errors": e.detail}, status=status.HTTP_400_BAD_REQUEST)
   
-    except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while creating admin")
+        return Response(
+            {"detail": "Unable to create the administrator due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 def create_user_and_admin(data):
     user_data = {"username": data["username"], "password": data["password"]}
@@ -150,12 +159,15 @@ def delete_admin(request, admin_id):
     try:
         if not _is_admin(request.user):
             return Response({"detail": "Administrator access required."}, status=status.HTTP_403_FORBIDDEN)
-        admin = get_object_or_404(Admin, id=admin_id)
-        admin_mapping = MapUserToRole.objects.get(role=MapUserToRole.RoleEnum.ADMIN, relatedid=admin_id)
-        user_id = admin_mapping.uuid
-        admin.delete()
-        admin_mapping.delete()
-        delete_user(user_id)
+        with transaction.atomic():
+            admin = get_object_or_404(Admin, id=admin_id)
+            admin_mapping = MapUserToRole.objects.get(
+                role=MapUserToRole.RoleEnum.ADMIN, relatedid=admin_id
+            )
+            user_id = admin_mapping.uuid
+            admin.delete()
+            admin_mapping.delete()
+            delete_user(user_id)
         return Response({"Detail": "Admin deleted successfully."}, status=status.HTTP_200_OK)
     except Admin.DoesNotExist:
         return Response({"error": "Admin not found."}, status=status.HTTP_404_NOT_FOUND)
@@ -163,5 +175,9 @@ def delete_admin(request, admin_id):
         return Response({"error": "Admin not found."}, status=status.HTTP_404_NOT_FOUND)
     except MapUserToRole.DoesNotExist:
         return Response({"error": "Admin mapping not found."}, status=status.HTTP_404_NOT_FOUND)
-    except Exception as e:
-        return Response({"error": f"An error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while deleting admin %s", admin_id)
+        return Response(
+            {"detail": "Unable to delete the administrator due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )

@@ -112,6 +112,23 @@ CSRF_COOKIE_SAMESITE = "Lax" if DEBUG else "None"
 SESSION_COOKIE_SECURE = _env_bool("SESSION_COOKIE_SECURE", default=not DEBUG)
 CSRF_COOKIE_SECURE = _env_bool("CSRF_COOKIE_SECURE", default=not DEBUG)
 
+# Transport security. HSTS is opt-in because enabling it before every required
+# hostname is permanently HTTPS-capable can make the site unreachable to users.
+SECURE_SSL_REDIRECT = _env_bool("SECURE_SSL_REDIRECT", default=not DEBUG)
+SECURE_HSTS_SECONDS = int(os.getenv("SECURE_HSTS_SECONDS", "0"))
+SECURE_HSTS_INCLUDE_SUBDOMAINS = _env_bool(
+    "SECURE_HSTS_INCLUDE_SUBDOMAINS", default=False
+)
+SECURE_HSTS_PRELOAD = _env_bool("SECURE_HSTS_PRELOAD", default=False)
+
+# Set this only when the trusted hosting proxy overwrites X-Forwarded-Proto.
+# This lets Django recognize HTTPS after TLS termination at that proxy.
+SECURE_PROXY_SSL_HEADER = (
+    ("HTTP_X_FORWARDED_PROTO", "https")
+    if _env_bool("TRUST_X_FORWARDED_PROTO", default=False)
+    else None
+)
+
 # HTTPOnly:
 SESSION_COOKIE_HTTPONLY = _env_bool("SESSION_COOKIE_HTTPONLY", default=True)
 CSRF_COOKIE_HTTPONLY = _env_bool("CSRF_COOKIE_HTTPONLY", default=False)
@@ -295,6 +312,15 @@ STATIC_URL = "static/"
 # ============================================================================
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+
+# Public password-reset requests can send email, so limit request frequency.
+# This scope is applied only to the reset endpoint's explicit throttle class.
+REST_FRAMEWORK = {
+    "DEFAULT_THROTTLE_RATES": {
+        "password_reset": "10/hour",
+    },
+}
 
 
 # ============================================================================

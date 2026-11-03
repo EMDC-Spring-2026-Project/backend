@@ -1,3 +1,5 @@
+import logging
+
 from django.db import transaction
 from rest_framework import status
 from rest_framework.decorators import (
@@ -23,6 +25,8 @@ from ..models import (
 )
 from ..serializers import JudgeSerializer
 from ..auth.serializers import UserSerializer
+
+logger = logging.getLogger(__name__)
 
 
 from django.contrib.auth import get_user_model
@@ -210,8 +214,12 @@ def create_judge(request):
 
     except ValidationError as e:
         return Response({"errors": e.detail}, status=status.HTTP_400_BAD_REQUEST)
-    except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while creating judge")
+        return Response(
+            {"detail": "Unable to create judge due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 def _get_delete_flags_for_cluster_type(cluster_id):
     """Get deletion flags based on cluster type to preserve scoresheets from other cluster types."""
     try:
@@ -305,9 +313,13 @@ def edit_judge(request):
                     # create_user_role_map returns a dict, extract uuid from it
                     user_uuid = user_mapping_dict.get("uuid") if isinstance(user_mapping_dict, dict) else user_mapping_dict["uuid"]
                     user = get_object_or_404(User, id=user_uuid)
-                except Exception as e:
+                except Exception:
+                    logger.exception(
+                        "Failed to create missing user-role mapping for judge %s",
+                        judge.id,
+                    )
                     raise ValidationError({
-                        "detail": f"Failed to create missing user role mapping for judge {judge.id}: {str(e)}"
+                        "detail": "Unable to link this judge account. Please try again or contact support."
                     })
 
             new_first_name = request.data.get("first_name", judge.first_name)
@@ -374,12 +386,23 @@ def edit_judge(request):
                 championship = payload.get("championship", False)
 
 
-                delete_flags = _get_delete_flags_for_cluster_type(cluster_id)
-                delete_sheets_for_teams_in_cluster(
-                    judge.id,
-                    cluster_id,
-                    *delete_flags
+                existing_assignment = MapJudgeToCluster.objects.filter(
+                    judgeid=judge.id, clusterid=cluster_id
+                ).first()
+                requested_flags = {
+                    "presentation": presentation, "journal": journal, "mdo": mdo,
+                    "runpenalties": runpenalties, "otherpenalties": otherpenalties,
+                    "redesign": redesign, "championship": championship,
+                }
+                assignment_unchanged = existing_assignment is not None and all(
+                    getattr(existing_assignment, field) == value
+                    for field, value in requested_flags.items()
                 )
+                # Contact edits resubmit assignments too. Preserve their saved
+                # sheets; the creation helper only adds missing sheet types.
+                if not assignment_unchanged:
+                    delete_flags = _get_delete_flags_for_cluster_type(cluster_id)
+                    delete_sheets_for_teams_in_cluster(judge.id, cluster_id, *delete_flags)
 
                 cluster_mapping = map_cluster_to_judge({
                     "judgeid": judge.id,
@@ -424,8 +447,11 @@ def edit_judge(request):
 
         serializer = JudgeSerializer(instance=judge)
 
-    except Exception as e:
-        raise ValidationError({"detail": str(e)})
+    except ValidationError:
+        raise
+    except Exception:
+        logger.exception("Unexpected error while editing judge %s", request.data.get("id"))
+        raise ValidationError({"detail": "Unable to update judge due to an unexpected server error."})
 
     return Response({"judge": serializer.data, "clusterids": updated_cluster_ids, "user": user_serializer.data}, status=status.HTTP_200_OK)
 
@@ -473,8 +499,12 @@ def delete_judge(request, judge_id):
 
     except ValidationError as e:  # Catching ValidationErrors specifically
         return Response({"errors": e.detail}, status=status.HTTP_400_BAD_REQUEST)
-    except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while deleting judge %s", judge_id)
+        return Response(
+            {"detail": "Unable to delete judge due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 def create_judge_instance(judge_data):
@@ -629,9 +659,6 @@ def judge_disqualify_team(request):
     if team_id is None or "judge_disqualified" not in request.data:
         return Response({"detail": "teamid and judge_disqualified are required."}, status=status.HTTP_400_BAD_REQUEST)
     team = get_object_or_404(Teams, id=team_id)
-    is_admin = request.user.is_superuser or MapUserToRole.objects.filter(
-        uuid=request.user.id, role=MapUserToRole.RoleEnum.ADMIN
-    ).exists()
     judge_ids = MapUserToRole.objects.filter(
         uuid=request.user.id, role=MapUserToRole.RoleEnum.JUDGE
     ).values_list("relatedid", flat=True)
@@ -649,7 +676,7 @@ def judge_disqualify_team(request):
         and bool(team_contest_ids)
         and team_contest_ids.issubset(judge_contest_ids)
     )
-    if not is_admin and not is_assigned_judge:
+    if not is_assigned_judge:
         return Response({"detail": "You are not allowed to disqualify this team."}, status=status.HTTP_403_FORBIDDEN)
     disqualified = request.data["judge_disqualified"]
     if isinstance(disqualified, str):
@@ -667,15 +694,6 @@ def judge_disqualify_team(request):
         )
     with transaction.atomic():
         team.judge_disqualified = disqualified
-        if team.judge_disqualified and team.organizer_disqualified:
-            team.cluster_rank = None
-            team.team_rank = None
-            scoresheet_ids = MapScoresheetToTeamJudge.objects.filter(
-                teamid=team.id
-            ).values_list("scoresheetid", flat=True)
-            Scoresheet.objects.filter(id__in=scoresheet_ids).update(
-                isSubmitted=True
-            )
         team.save()
     return Response(status=status.HTTP_200_OK)
 
@@ -707,5 +725,9 @@ def get_all_judges(request):
         judges = Judge.objects.all()
         serializer = JudgeSerializer(judges, many=True)
         return Response({"Judges": serializer.data}, status=status.HTTP_200_OK)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading judges")
+        return Response(
+            {"error": "Unable to load judges due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )

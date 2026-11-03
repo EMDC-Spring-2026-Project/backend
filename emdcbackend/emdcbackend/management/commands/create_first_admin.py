@@ -7,14 +7,17 @@ Usage:
     # Interactive mode (prompts for input)
     python manage.py create_first_admin
     
-    # Non-interactive mode (provide all details)
-    python manage.py create_first_admin --username admin@example.com --password SecurePass123! --first-name Admin --last-name User
+    # Non-interactive mode (read the password from the named environment variable)
+    CREATE_ADMIN_PASSWORD='...' python manage.py create_first_admin --username admin@example.com --password-env CREATE_ADMIN_PASSWORD
 """
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 from django.core.exceptions import ValidationError
+from django.contrib.auth.password_validation import validate_password
 from django.db import transaction
 from django.contrib.auth.models import User
+import os
+from getpass import getpass
 from emdcbackend.models import Admin, MapUserToRole
 from emdcbackend.serializers import AdminSerializer
 
@@ -29,9 +32,9 @@ class Command(BaseCommand):
             help='Email address for the admin account',
         )
         parser.add_argument(
-            '--password',
+            '--password-env',
             type=str,
-            help='Password for the admin account',
+            help='Name of the environment variable containing the password',
         )
         parser.add_argument(
             '--first-name',
@@ -61,18 +64,36 @@ class Command(BaseCommand):
         if not username:
             username = input('Email address (username): ').strip()
             if not username:
-                self.stdout.write(self.style.ERROR('Username is required.'))
-                return
+                raise CommandError('Username is required.')
 
-        password = options.get('password')
-        if not password:
-            password = input('Password: ').strip()
+        password_env = options.get('password_env')
+        if password_env:
+            password = os.environ.get(password_env)
             if not password:
-                self.stdout.write(self.style.ERROR('Password is required.'))
-                return
+                raise CommandError(f'Password environment variable {password_env} is not set.')
+        else:
+            password = getpass('Password: ')
+            if not password:
+                raise CommandError('Password is required.')
+            password_confirmation = getpass('Confirm password: ')
+            if password != password_confirmation:
+                raise CommandError('Passwords do not match.')
 
         first_name = options.get('first_name', 'Admin')
         last_name = options.get('last_name', 'User')
+
+        candidate_user = User(
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+        )
+        try:
+            validate_password(password, user=candidate_user)
+        except ValidationError as error:
+            messages = '; '.join(error.messages)
+            raise CommandError(
+                f'Password does not meet the password requirements: {messages}'
+            ) from error
 
         # Check if user already exists
         existing_user = User.objects.filter(username__iexact=username).first()

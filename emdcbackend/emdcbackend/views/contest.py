@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework import status
 from rest_framework.decorators import (
     api_view,
@@ -16,6 +18,9 @@ from ..models import Contest, MapContestToOrganizer, MapUserToRole
 from ..serializers import ContestSerializer
 from .clusters import make_cluster
 from .Maps.MapClusterToContest import map_cluster_to_contest
+
+
+logger = logging.getLogger(__name__)
 
 
 def _is_admin(user):
@@ -114,8 +119,12 @@ def create_contest(request):
 
   except ValidationError as e:  # Catching ValidationErrors specifically
       return Response({"errors": e.detail}, status=status.HTTP_400_BAD_REQUEST)
-  except Exception as e:
-      return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+  except Exception:
+      logger.exception("Unexpected error while creating contest")
+      return Response(
+          {"detail": "Unable to create the contest due to an unexpected server error."},
+          status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+      )
   
 # Helper method to create contest
 def create_contest_instance(contest_data):
@@ -140,9 +149,41 @@ def edit_contest(request):
   contest.date = request.data.get("date", contest.date)
   contest.is_open = request.data.get("is_open", contest.is_open)
   contest.is_tabulated = request.data.get("is_tabulated", contest.is_tabulated)
+  if contest.is_open:
+      # Reopening a round must immediately withdraw any previously released results.
+      contest.results_published = False
   contest.save()
   serializer = ContestSerializer(instance=contest)
   return Response({"Contest":serializer.data}, status=status.HTTP_200_OK)
+
+
+@api_view(["POST"])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
+def publish_contest_results(request, contest_id):
+  contest = get_object_or_404(Contest, id=contest_id)
+  if not _can_edit_contest(request.user, contest.id):
+      return Response(
+          {"detail": "You cannot publish this contest's results."},
+          status=status.HTTP_403_FORBIDDEN,
+      )
+  if contest.is_open or not contest.is_tabulated:
+      return Response(
+          {"detail": "Close and finish tabulating the contest before publishing results."},
+          status=status.HTTP_409_CONFLICT,
+      )
+  published = request.data.get("published", True)
+  if not isinstance(published, bool):
+      return Response(
+          {"detail": "published must be true or false."},
+          status=status.HTTP_400_BAD_REQUEST,
+      )
+  contest.results_published = published
+  contest.save(update_fields=["results_published"])
+  return Response(
+      {"Contest": ContestSerializer(instance=contest).data},
+      status=status.HTTP_200_OK,
+  )
 
 
 @api_view(["DELETE"])
@@ -276,7 +317,8 @@ def delete_contest(request, contest_id):
             
     except Http404:
         return Response({"detail": "Contest not found."}, status=status.HTTP_404_NOT_FOUND)
-    except Exception as e:
+    except Exception:
+        logger.exception("Unexpected error while deleting contest %s", contest_id)
         return Response({
-            "detail": f"Error deleting contest: {str(e)}"
+            "detail": "Unable to delete the contest due to an unexpected server error."
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

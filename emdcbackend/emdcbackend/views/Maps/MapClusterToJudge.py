@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework import status
 from rest_framework.decorators import (
     api_view,
@@ -8,11 +10,12 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
-from django.db import models
 from django.shortcuts import get_object_or_404
 from ...models import JudgeClusters, Judge, MapJudgeToCluster, MapContestToCluster, MapContestToOrganizer, MapScoresheetToTeamJudge, Scoresheet, MapClusterToTeam, MapUserToRole
 from django.db import transaction
 from ...serializers import JudgeClustersSerializer, JudgeSerializer, ClusterToJudgeSerializer
+
+logger = logging.getLogger(__name__)
 
 
 def _can_manage_cluster(user, cluster_id):
@@ -51,8 +54,12 @@ def create_cluster_judge_mapping(request):
     except ValidationError as e:
         return Response({"errors": e.detail}, status=status.HTTP_400_BAD_REQUEST)
 
-    except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while assigning judge to cluster")
+        return Response(
+            {"detail": "Unable to save the judge assignment due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 @api_view(["GET"])
 @authentication_classes([SessionAuthentication])
@@ -99,17 +106,7 @@ def cluster_by_judge_id(request, judge_id):
         cluster_ids = mappings.values_list('clusterid', flat=True)
         clusters = JudgeClusters.objects.filter(id__in=cluster_ids)
         
-        # Filter by active status if the field exists
-        try:
-            test_cluster = clusters.first()
-            if test_cluster and hasattr(test_cluster, 'is_active'):
-                clusters = clusters.filter(
-                    models.Q(is_active=True) | models.Q(is_active__isnull=True)
-                )
-            else:
-                pass
-        except Exception as filter_error:
-            pass
+        clusters = clusters.filter(is_active=True)
         
         # Return the first active cluster (for backward compatibility)
         if clusters.exists():
@@ -119,8 +116,12 @@ def cluster_by_judge_id(request, judge_id):
         else:
             return Response({"error": "No active clusters found for the given judge"}, status=status.HTTP_404_NOT_FOUND)
             
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading cluster for judge %s", judge_id)
+        return Response(
+            {"error": "Unable to load the judge's cluster due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 @api_view(["GET"])
@@ -130,46 +131,59 @@ def all_clusters_by_judge_id(request, judge_id):
     """Get all clusters for a judge across all contests"""
     try:
         
-        mappings = MapJudgeToCluster.objects.filter(judgeid=judge_id)
-        cluster_ids = mappings.values_list('clusterid', flat=True)
-        
-        # Get all clusters for this judge
-        clusters = JudgeClusters.objects.filter(id__in=cluster_ids)
-        
-        # Filter by is_active status (now that field exists)
-        clusters = clusters.filter(is_active=True)
-        
-        serializer = JudgeClustersSerializer(clusters, many=True)
-        cluster_data = serializer.data
-
-        assignment_map = {
-            (assignment.clusterid): assignment
-            for assignment in MapJudgeToCluster.objects.filter(judgeid=judge_id, clusterid__in=cluster_ids)
+        mappings = list(MapJudgeToCluster.objects.filter(judgeid=judge_id))
+        cluster_ids = [mapping.clusterid for mapping in mappings]
+        clusters_by_id = {
+            cluster.id: cluster
+            for cluster in JudgeClusters.objects.filter(
+                id__in=cluster_ids, is_active=True
+            )
         }
 
-        # Add contest information and sheet flags to each cluster
-        for cluster in cluster_data:
-            try:
-                contest_mapping = MapContestToCluster.objects.filter(clusterid=cluster['id']).first()
-                cluster['contest_id'] = contest_mapping.contestid if contest_mapping else None
-            except Exception:
-                cluster['contest_id'] = None
+        cluster_data = []
+        for assignment in mappings:
+            cluster = clusters_by_id.get(assignment.clusterid)
+            if cluster is None:
+                continue
 
-            assignment = assignment_map.get(cluster["id"])
-            if assignment:
-                cluster["sheet_flags"] = {
-                    "presentation": assignment.presentation,
-                    "journal": assignment.journal,
-                    "mdo": assignment.mdo,
-                    "runpenalties": assignment.runpenalties,
-                    "otherpenalties": assignment.otherpenalties,
-                    "redesign": assignment.redesign,
-                    "championship": assignment.championship,
-                }
+            contest_ids = set(MapContestToCluster.objects.filter(
+                clusterid=cluster.id
+            ).values_list("contestid", flat=True))
+            if assignment.contestid is not None:
+                # A contest-specific judge assignment is authoritative. Ignore
+                # stale mappings whose cluster is no longer linked to it.
+                if assignment.contestid not in contest_ids:
+                    continue
+                contest_id = assignment.contestid
+            elif len(contest_ids) == 1:
+                # Legacy assignments are safe to infer only for a single-contest cluster.
+                contest_id = next(iter(contest_ids))
+            elif len(contest_ids) > 1:
+                # An old assignment on a shared cluster cannot be attributed safely.
+                continue
+            else:
+                contest_id = None
+
+            cluster_payload = JudgeClustersSerializer(instance=cluster).data
+            cluster_payload["contest_id"] = contest_id
+            cluster_payload["sheet_flags"] = {
+                "presentation": assignment.presentation,
+                "journal": assignment.journal,
+                "mdo": assignment.mdo,
+                "runpenalties": assignment.runpenalties,
+                "otherpenalties": assignment.otherpenalties,
+                "redesign": assignment.redesign,
+                "championship": assignment.championship,
+            }
+            cluster_data.append(cluster_payload)
 
         return Response({"Clusters": cluster_data}, status=status.HTTP_200_OK)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading clusters for judge %s", judge_id)
+        return Response(
+            {"error": "Unable to load judge clusters due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 def _delete_cluster_judge_mapping_and_scores(map_id: int):
@@ -186,8 +200,12 @@ def _delete_cluster_judge_mapping_and_scores(map_id: int):
 
         # Get the contest ID for this cluster (to check if judge should be removed from contest)
         from ...models import MapContestToCluster, MapContestToJudge, MapContestToTeam
-        contest_cluster_mapping = MapContestToCluster.objects.filter(clusterid=cluster_id).first()
-        contest_id = contest_cluster_mapping.contestid if contest_cluster_mapping else None
+        contest_ids = set(MapContestToCluster.objects.filter(
+            clusterid=cluster_id
+        ).values_list("contestid", flat=True))
+        assignment_contest_id = mapping.contestid
+        if assignment_contest_id not in contest_ids:
+            assignment_contest_id = next(iter(contest_ids), None)
 
         # Get cluster type to determine if we need to clean up advanced scoresheets
         cluster = None
@@ -204,20 +222,54 @@ def _delete_cluster_judge_mapping_and_scores(map_id: int):
             is_advanced_cluster = False
 
         team_ids = list(MapClusterToTeam.objects.filter(clusterid=cluster_id).values_list('teamid', flat=True))
+        if not team_ids and contest_ids:
+            team_ids = list(MapContestToTeam.objects.filter(
+                contestid__in=contest_ids
+            ).values_list("teamid", flat=True))
+
+        # Scoresheet mappings have no cluster/contest key. Keep mappings for
+        # teams shared with another contest or another cluster for this judge.
+        shared_team_ids = set(MapContestToTeam.objects.filter(
+            teamid__in=team_ids
+        ).exclude(contestid__in=contest_ids).values_list("teamid", flat=True))
+        other_cluster_ids = MapJudgeToCluster.objects.filter(
+            judgeid=judge_id
+        ).exclude(clusterid=cluster_id).values_list("clusterid", flat=True)
+        other_cluster_ids = list(other_cluster_ids)
+        other_cluster_team_ids = set(MapClusterToTeam.objects.filter(
+            clusterid__in=other_cluster_ids, teamid__in=team_ids
+        ).values_list("teamid", flat=True))
+        other_contest_ids = MapContestToCluster.objects.filter(
+            clusterid__in=other_cluster_ids
+        ).values_list("contestid", flat=True)
+        other_cluster_team_ids.update(MapContestToTeam.objects.filter(
+            contestid__in=other_contest_ids, teamid__in=team_ids
+        ).values_list("teamid", flat=True))
+        shared_team_ids.update(other_cluster_team_ids)
+        team_ids_to_clean = [team_id for team_id in team_ids if team_id not in shared_team_ids]
         if team_ids:
-            score_map_qs = MapScoresheetToTeamJudge.objects.filter(judgeid=judge_id, teamid__in=team_ids)
+            score_map_qs = MapScoresheetToTeamJudge.objects.filter(
+                judgeid=judge_id, teamid__in=team_ids_to_clean
+            )
             scoresheet_ids = list(score_map_qs.values_list('scoresheetid', flat=True))
             # Delete mappings first, then scoresheets
             score_map_qs.delete()
             if scoresheet_ids:
-                Scoresheet.objects.filter(id__in=scoresheet_ids).delete()
+                still_referenced_ids = MapScoresheetToTeamJudge.objects.filter(
+                    scoresheetid__in=scoresheet_ids
+                ).values_list("scoresheetid", flat=True)
+                Scoresheet.objects.filter(id__in=scoresheet_ids).exclude(
+                    id__in=still_referenced_ids
+                ).delete()
         
         # For championship/redesign clusters, delete advanced scoresheets (types 6 and 7)
         # for this judge and teams in this specific contest to prevent stale data when judges are moved between clusters
-        if is_advanced_cluster and cluster and contest_id:
+        if is_advanced_cluster and cluster and assignment_contest_id:
             # Get all teams in this contest
             contest_team_ids = list(
-                MapContestToTeam.objects.filter(contestid=contest_id).values_list('teamid', flat=True)
+                MapContestToTeam.objects.filter(contestid__in=contest_ids).exclude(
+                    teamid__in=shared_team_ids
+                ).values_list('teamid', flat=True)
             )
             
             if contest_team_ids:
@@ -248,17 +300,22 @@ def _delete_cluster_judge_mapping_and_scores(map_id: int):
                 old_scoresheet_ids = list(old_advanced_sheets.values_list('scoresheetid', flat=True))
                 old_advanced_sheets.delete()
                 if old_scoresheet_ids:
-                    Scoresheet.objects.filter(id__in=old_scoresheet_ids).delete()
+                    still_referenced_ids = MapScoresheetToTeamJudge.objects.filter(
+                        scoresheetid__in=old_scoresheet_ids
+                    ).values_list("scoresheetid", flat=True)
+                    Scoresheet.objects.filter(id__in=old_scoresheet_ids).exclude(
+                        id__in=still_referenced_ids
+                    ).delete()
 
         # Delete the judge<->cluster mapping
         mapping.delete()
         
         # Check if judge is still in any other clusters for this contest
         # If not, remove the contest-judge mapping
-        if contest_id:
+        if contest_ids:
             # Get all clusters for this contest
             contest_cluster_ids = MapContestToCluster.objects.filter(
-                contestid=contest_id
+                contestid__in=contest_ids
             ).values_list('clusterid', flat=True)
             
             # Check if judge is still in any of those clusters
@@ -271,7 +328,7 @@ def _delete_cluster_judge_mapping_and_scores(map_id: int):
             if not remaining_cluster_mappings:
                 MapContestToJudge.objects.filter(
                     judgeid=judge_id,
-                    contestid=contest_id
+                    contestid__in=contest_ids
                 ).delete()
 
 
@@ -290,10 +347,30 @@ def map_cluster_to_judge(map_data):
     judgeid = map_data["judgeid"]
     clusterid = map_data["clusterid"]
     contestid = map_data.get("contestid")
+    if isinstance(contestid, bool):
+        raise ValidationError({"contestid": "contestid must be a positive integer."})
+    if contestid is not None:
+        try:
+            contestid = int(contestid)
+        except (TypeError, ValueError):
+            raise ValidationError({"contestid": "contestid must be a positive integer."})
+        if contestid <= 0:
+            raise ValidationError({"contestid": "contestid must be a positive integer."})
+    cluster_contest_ids = set(
+        MapContestToCluster.objects.filter(clusterid=clusterid)
+        .values_list("contestid", flat=True)
+    )
 
     if contestid is None:
-        contest_mapping = MapContestToCluster.objects.filter(clusterid=clusterid).first()
-        contestid = contest_mapping.contestid if contest_mapping else None
+        if len(cluster_contest_ids) > 1:
+            raise ValidationError(
+                {"contestid": "contestid is required when the cluster belongs to multiple contests."}
+            )
+        contestid = next(iter(cluster_contest_ids), None)
+    elif cluster_contest_ids and contestid not in cluster_contest_ids:
+        raise ValidationError(
+            {"contestid": "The selected contest does not use this cluster."}
+        )
 
     defaults = {
         "contestid": contestid,
@@ -313,6 +390,14 @@ def map_cluster_to_judge(map_data):
     )
 
     if not created:
+        if (
+            assignment.contestid is not None
+            and contestid is not None
+            and assignment.contestid != contestid
+        ):
+            raise ValidationError(
+                {"contestid": "This judge is already assigned to this cluster for another contest."}
+            )
         for field, value in defaults.items():
             setattr(assignment, field, value)
         assignment.save()

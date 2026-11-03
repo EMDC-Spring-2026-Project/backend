@@ -1,3 +1,5 @@
+import logging
+
 from django.core.exceptions import FieldError
 from django.shortcuts import get_object_or_404
 from rest_framework import status
@@ -16,6 +18,8 @@ from ...models import (
 )
 from ...serializers import SpecialAwardSerializer
 # FILE OVERVIEW: This file contains all views associated with the special awards URLs
+
+logger = logging.getLogger(__name__)
 
 
 def _role_ids(user, role):
@@ -100,8 +104,12 @@ def create_award_team_mapping(request):
             serializer.save()
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while creating team award")
+        return Response(
+            {"error": "Unable to create the award due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 # GET request to get award_id by team_id
 # Gets all award maps associated with a given team_id.
@@ -114,8 +122,12 @@ def get_award_id_by_team_id(request, team_id):
         awards = SpecialAward.objects.filter(teamid=team_id)
         serializer = SpecialAwardSerializer(awards, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading awards for team %s", team_id)
+        return Response(
+            {"error": "Unable to load awards due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 # Delete award map by team_ID and award_name accepts these as URL params
 # If it deletes properly 204 if not 404/500 code 
@@ -137,8 +149,12 @@ def delete_award_team_mapping_by_id(request, team_id, award_name):
         return Response(status=status.HTTP_204_NO_CONTENT)
     except SpecialAward.DoesNotExist:
         return Response({"error": "Award not found"}, status=status.HTTP_404_NOT_FOUND)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while deleting award for team %s", team_id)
+        return Response(
+            {"error": "Unable to delete the award due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 # PUT request for updating an award map
 # accepts team_id and award_name as url params
@@ -170,8 +186,12 @@ def update_award_team_mapping(request, team_id, award_name):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     except SpecialAward.DoesNotExist:
         return Response({"error": "Award not found"}, status=status.HTTP_404_NOT_FOUND)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while updating award for team %s", team_id)
+        return Response(
+            {"error": "Unable to update the award due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
     
 # GET request that returns all awards
 @api_view(["GET"])
@@ -183,8 +203,12 @@ def get_all_awards(request):
         serializer = SpecialAwardSerializer(award, many=True)
         return Response({"awards": serializer.data}, status=status.HTTP_200_OK)
 
-    except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading all awards")
+        return Response(
+            {"detail": "Unable to load awards due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
     
 # Get request to get get all awards based on isJudge boolean
 # used in frontend pages for organizers and judge only show their respective awards
@@ -197,5 +221,9 @@ def get_awards_by_role(request, isJudge):
         awards = SpecialAward.objects.filter(isJudge=is_judge)
         serializer = SpecialAwardSerializer(awards, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading awards by role")
+        return Response(
+            {"error": "Unable to load awards due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )

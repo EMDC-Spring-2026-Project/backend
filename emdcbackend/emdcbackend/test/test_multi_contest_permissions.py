@@ -15,6 +15,7 @@ from ..models import (
     MapContestToOrganizer,
     MapContestToTeam,
     MapClusterToTeam,
+    MapJudgeToCluster,
     MapScoresheetToTeamJudge,
     MapUserToRole,
     Organizer,
@@ -108,6 +109,142 @@ class MultiContestPermissionTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.assertTrue(JudgeClusters.objects.filter(id=cluster.id).exists())
 
+    def test_organizer_cannot_remove_judge_from_cluster_shared_with_unmanaged_contest(self):
+        cluster = JudgeClusters.objects.create(cluster_name="Shared Judge Cluster")
+        judge = Judge.objects.create(
+            first_name="Shared", last_name="Judge", phone_number="5551234567",
+            contestid=self.managed_contest.id,
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.managed_contest.id, clusterid=cluster.id
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.other_contest.id, clusterid=cluster.id
+        )
+        judge_cluster_mapping = MapJudgeToCluster.objects.create(
+            judgeid=judge.id, clusterid=cluster.id, contestid=self.managed_contest.id
+        )
+
+        response = self.client.delete(
+            reverse("remove_judge_from_cluster", args=[judge.id, cluster.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("every contest it belongs to", response.data["detail"])
+        self.assertTrue(
+            MapJudgeToCluster.objects.filter(id=judge_cluster_mapping.id).exists()
+        )
+
+    def test_organizer_cannot_remove_judge_from_contest_via_shared_cluster(self):
+        cluster = JudgeClusters.objects.create(cluster_name="Shared Judge Cluster")
+        judge = Judge.objects.create(
+            first_name="Shared", last_name="Judge", phone_number="5551234567",
+            contestid=self.managed_contest.id,
+        )
+        MapContestToJudge.objects.create(
+            contestid=self.managed_contest.id, judgeid=judge.id
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.managed_contest.id, clusterid=cluster.id
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.other_contest.id, clusterid=cluster.id
+        )
+        judge_cluster_mapping = MapJudgeToCluster.objects.create(
+            judgeid=judge.id, clusterid=cluster.id, contestid=self.managed_contest.id
+        )
+
+        response = self.client.delete(
+            reverse(
+                "remove_judge_from_contest",
+                args=[judge.id, self.managed_contest.id],
+            )
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("every contest", response.data["detail"])
+        self.assertTrue(
+            MapContestToJudge.objects.filter(
+                contestid=self.managed_contest.id, judgeid=judge.id
+            ).exists()
+        )
+        self.assertTrue(
+            MapJudgeToCluster.objects.filter(id=judge_cluster_mapping.id).exists()
+        )
+
+    def test_removing_judge_preserves_scoresheets_for_teams_shared_with_another_contest(self):
+        cluster = JudgeClusters.objects.create(cluster_name="Managed Cluster")
+        team = self._link_team_to_both_contests()
+        judge = Judge.objects.create(
+            first_name="Contest", last_name="Judge", phone_number="5551234567",
+            contestid=self.managed_contest.id,
+        )
+        scoresheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=False
+        )
+        MapContestToJudge.objects.create(
+            contestid=self.managed_contest.id, judgeid=judge.id
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.managed_contest.id, clusterid=cluster.id
+        )
+        MapJudgeToCluster.objects.create(
+            judgeid=judge.id, clusterid=cluster.id, contestid=self.managed_contest.id
+        )
+        MapClusterToTeam.objects.create(clusterid=cluster.id, teamid=team.id)
+        score_mapping = MapScoresheetToTeamJudge.objects.create(
+            teamid=team.id, judgeid=judge.id, scoresheetid=scoresheet.id,
+            sheetType=ScoresheetEnum.PRESENTATION,
+        )
+
+        response = self.client.delete(
+            reverse(
+                "remove_judge_from_contest",
+                args=[judge.id, self.managed_contest.id],
+            )
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertFalse(
+            MapContestToJudge.objects.filter(
+                contestid=self.managed_contest.id, judgeid=judge.id
+            ).exists()
+        )
+        self.assertTrue(
+            MapScoresheetToTeamJudge.objects.filter(id=score_mapping.id).exists()
+        )
+        self.assertTrue(Scoresheet.objects.filter(id=scoresheet.id).exists())
+
+    def test_deleting_cluster_judge_mapping_preserves_shared_team_scoresheets(self):
+        cluster = JudgeClusters.objects.create(cluster_name="Managed Cluster")
+        team = self._link_team_to_both_contests()
+        judge = Judge.objects.create(
+            first_name="Contest", last_name="Judge", phone_number="5551234567",
+            contestid=self.managed_contest.id,
+        )
+        MapContestToCluster.objects.create(
+            contestid=self.managed_contest.id, clusterid=cluster.id
+        )
+        mapping = MapJudgeToCluster.objects.create(
+            judgeid=judge.id, clusterid=cluster.id, contestid=self.managed_contest.id
+        )
+        MapClusterToTeam.objects.create(clusterid=cluster.id, teamid=team.id)
+        sheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=False
+        )
+        score_mapping = MapScoresheetToTeamJudge.objects.create(
+            teamid=team.id, judgeid=judge.id, scoresheetid=sheet.id,
+            sheetType=ScoresheetEnum.PRESENTATION,
+        )
+
+        response = self.client.delete(
+            reverse("delete_cluster_judge_mapping", args=[mapping.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertTrue(MapScoresheetToTeamJudge.objects.filter(id=score_mapping.id).exists())
+        self.assertTrue(Scoresheet.objects.filter(id=sheet.id).exists())
+
     def test_organizer_cannot_disqualify_team_shared_with_unmanaged_contest(self):
         team = self._link_team_to_both_contests()
 
@@ -118,7 +255,7 @@ class MultiContestPermissionTests(APITestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertIn("every contest it belongs to", response.data["detail"])
+        self.assertIn("Only an assigned judge", response.data["detail"])
         team.refresh_from_db()
         self.assertFalse(team.organizer_disqualified)
 

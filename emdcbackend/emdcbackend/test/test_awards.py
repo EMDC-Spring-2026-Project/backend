@@ -7,6 +7,7 @@ from ..models import (
     SpecialAward, Teams, Admin, Organizer, Judge, Contest, MapUserToRole,
     MapContestToOrganizer, MapContestToJudge, MapContestToTeam,
 )
+from unittest.mock import patch
 
 
 class AwardAPITests(APITestCase):
@@ -85,6 +86,58 @@ class AwardAPITests(APITestCase):
         url = reverse('get_awards_by_role', args=["True"])
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_award_endpoints_hide_unexpected_server_errors(self):
+        award = SpecialAward.objects.create(
+            teamid=self.team.id, award_name="Failure Test Award", isJudge=True
+        )
+        failing_response_calls = [
+            ("create award", "create_award_team_mapping", "post", {
+                "teamid": self.team.id,
+                "award_name": "Another Award",
+                "isJudge": True,
+            }, "emdcbackend.views.Maps.MapAwardToTeam.SpecialAwardSerializer"),
+            ("get award list", "get_all_awards", "get", None,
+             "emdcbackend.views.Maps.MapAwardToTeam.SpecialAwardSerializer"),
+            ("get team awards", "get_award_id_by_team_id", "get", None,
+             "emdcbackend.views.Maps.MapAwardToTeam.SpecialAwardSerializer"),
+        ]
+
+        for label, route, method, data, target in failing_response_calls:
+            with self.subTest(endpoint=label):
+                with self.assertLogs("emdcbackend.views.Maps.MapAwardToTeam", level="ERROR"):
+                    with patch(target, side_effect=RuntimeError("sensitive database detail")):
+                        if route == "get_award_id_by_team_id":
+                            response = self.client.get(reverse(route, args=[self.team.id]))
+                        else:
+                            response = getattr(self.client, method)(reverse(route), data or {})
+
+                self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+                self.assertNotIn("sensitive database detail", str(response.data))
+
+        for endpoint, method, url, target, data in [
+            (
+                "update",
+                "put",
+                reverse("update_award_team_mapping", args=[self.team.id, award.award_name]),
+                "emdcbackend.views.Maps.MapAwardToTeam.SpecialAwardSerializer.save",
+                {"award_name": "Updated Award"},
+            ),
+            (
+                "delete",
+                "delete",
+                reverse("delete_award_team_mapping_by_id", args=[self.team.id, award.award_name]),
+                "emdcbackend.views.Maps.MapAwardToTeam.SpecialAward.delete",
+                None,
+            ),
+        ]:
+            with self.subTest(endpoint=endpoint):
+                with self.assertLogs("emdcbackend.views.Maps.MapAwardToTeam", level="ERROR"):
+                    with patch(target, side_effect=RuntimeError("sensitive database detail")):
+                        response = getattr(self.client, method)(url, data or {}, **({"format": "json"} if data else {}))
+
+                self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+                self.assertNotIn("sensitive database detail", str(response.data))
 
     def test_unprivileged_user_cannot_change_awards(self):
         award = SpecialAward.objects.create(

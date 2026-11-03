@@ -8,9 +8,40 @@ from ..models import (
     Scoresheet, ScoresheetEnum, MapScoresheetToTeamJudge,
 )
 from ..serializers import JudgeSerializer
+from unittest.mock import patch
 
 
 class JudgeAPITests(APITestCase):
+    def test_contact_edit_with_unchanged_assignment_preserves_submitted_scores(self):
+        judge = Judge.objects.create(first_name="Original", last_name="Judge", contestid=self.contest.id)
+        user = User.objects.create_user(username="preserve-judge@example.com", password="password")
+        MapUserToRole.objects.create(uuid=user.id, role=3, relatedid=judge.id)
+        MapContestToJudge.objects.create(contestid=self.contest.id, judgeid=judge.id)
+        MapJudgeToCluster.objects.create(
+            judgeid=judge.id, clusterid=self.cluster.id, contestid=self.contest.id, presentation=True,
+        )
+        team = Teams.objects.create(team_name="Scored Team")
+        from ..models import MapClusterToTeam
+        MapClusterToTeam.objects.create(clusterid=self.cluster.id, teamid=team.id)
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=team.id)
+        sheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=True,
+            field1=5, field2=1, field3=1, field4=1, field5=1, field6=1, field7=1, field8=1,
+        )
+        mapping = MapScoresheetToTeamJudge.objects.create(
+            teamid=team.id, judgeid=judge.id, scoresheetid=sheet.id, sheetType=ScoresheetEnum.PRESENTATION,
+        )
+        response = self.client.post(reverse("edit_judge"), {
+            "id": judge.id, "first_name": "Corrected", "phone_number": "9999999999",
+            "clusters": [{"clusterid": self.cluster.id, "contestid": self.contest.id, "presentation": True}],
+        }, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertTrue(Scoresheet.objects.filter(id=sheet.id).exists())
+        sheet.refresh_from_db()
+        self.assertEqual(sheet.field1, 5)
+        self.assertTrue(sheet.isSubmitted)
+        self.assertTrue(MapScoresheetToTeamJudge.objects.filter(id=mapping.id).exists())
+
     def setUp(self):
         # Create a user and login using session authentication
         self.user = User.objects.create_user(username="testuser@example.com", password="testpassword")
@@ -75,6 +106,26 @@ class JudgeAPITests(APITestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data['Judges']), 2)
+
+    def test_get_all_judges_hides_unexpected_server_errors(self):
+        with self.assertLogs("emdcbackend.views.judge", level="ERROR"):
+            with patch("emdcbackend.views.judge.JudgeSerializer", side_effect=RuntimeError("sensitive database detail")):
+                response = self.client.get(reverse("get_all_judges"))
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("sensitive database detail", str(response.data))
+
+    def test_create_judge_hides_unexpected_server_errors(self):
+        with self.assertLogs("emdcbackend.views.judge", level="ERROR"):
+            with patch("emdcbackend.views.judge.create_user_and_judge", side_effect=RuntimeError("sensitive database detail")):
+                response = self.client.post(
+                    reverse("create_judge"),
+                    {"contestid": self.contest.id},
+                    format="json",
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("sensitive database detail", str(response.data))
 
     def test_judge_directory_requires_sign_in(self):
         judge = Judge.objects.create(
@@ -277,6 +328,18 @@ class JudgeAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertFalse(Judge.objects.filter(id=judge.id).exists())
 
+    def test_delete_judge_hides_unexpected_server_errors(self):
+        judge = Judge.objects.create(
+            first_name="Protected", last_name="Judge", phone_number="1234567890",
+            contestid=self.contest.id,
+        )
+        with self.assertLogs("emdcbackend.views.judge", level="ERROR"):
+            with patch("emdcbackend.views.judge.Judge.delete", side_effect=RuntimeError("sensitive database detail")):
+                response = self.client.delete(reverse("delete_judge", args=[judge.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("sensitive database detail", str(response.data))
+
     def test_delete_missing_judge_returns_not_found(self):
         response = self.client.delete(reverse('delete_judge', args=[999999]))
 
@@ -370,6 +433,17 @@ class JudgeAPITests(APITestCase):
             total_score=255.0,
             championship_score=0.0
         )
+        MapUserToRole.objects.filter(uuid=self.user.id).delete()
+        MapUserToRole.objects.create(uuid=self.user.id, role=3, relatedid=judge.id)
+        MapContestToJudge.objects.create(contestid=self.contest.id, judgeid=judge.id)
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=team.id)
+        sheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=False
+        )
+        MapScoresheetToTeamJudge.objects.create(
+            teamid=team.id, judgeid=judge.id, scoresheetid=sheet.id,
+            sheetType=ScoresheetEnum.PRESENTATION,
+        )
         url = reverse('judge_disqualify_team')
         data = {"teamid": team.id, "judge_disqualified": True}
         response = self.client.post(url, data, format='json')
@@ -459,7 +533,7 @@ class JudgeAPITests(APITestCase):
         team.refresh_from_db()
         self.assertFalse(team.judge_disqualified)
 
-    def test_judge_finalizes_team_when_organizer_disqualified_first(self):
+    def test_judge_disqualification_preserves_scores_for_review(self):
         team = Teams.objects.create(
             team_name="Organizer First Team",
             organizer_disqualified=True,
@@ -501,6 +575,6 @@ class JudgeAPITests(APITestCase):
         team.refresh_from_db()
         scoresheet.refresh_from_db()
         self.assertTrue(team.judge_disqualified)
-        self.assertIsNone(team.team_rank)
-        self.assertIsNone(team.cluster_rank)
-        self.assertTrue(scoresheet.isSubmitted)
+        self.assertEqual(team.team_rank, 3)
+        self.assertEqual(team.cluster_rank, 2)
+        self.assertFalse(scoresheet.isSubmitted)

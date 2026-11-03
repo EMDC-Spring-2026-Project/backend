@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework import status
 from rest_framework.decorators import (
   api_view,
@@ -7,11 +9,14 @@ from rest_framework.decorators import (
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.authentication import SessionAuthentication
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from django.shortcuts import get_object_or_404
 
 from ...models import MapContestToJudge, Judge, Contest, MapContestToCluster, MapContestToOrganizer, MapJudgeToCluster, MapUserToRole
 from ...serializers import MapContestToJudgeSerializer, ContestSerializer, JudgeSerializer
+from ...views.contest_utils import judge_cluster_assignments_for_contest
+
+logger = logging.getLogger(__name__)
 
 
 def _can_manage_contest(user, contest_id):
@@ -41,8 +46,12 @@ def create_contest_judge_mapping(request):
     except ValidationError as e:
         return Response({"errors": e.detail}, status=status.HTTP_400_BAD_REQUEST)
 
-    except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while creating contest-judge mapping")
+        return Response(
+            {"detail": "Unable to save the judge assignment due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 @api_view(['GET'])
@@ -52,16 +61,27 @@ def get_all_judges_by_contest_id(request, contest_id):
     # Only count judges that are actually assigned to clusters in this contest
     # This ensures judges removed from clusters are not counted
     
-    # Get all clusters for this contest
-    cluster_ids = MapContestToCluster.objects.filter(contestid=contest_id).values_list('clusterid', flat=True).distinct()
-    
     # Get all judges assigned to those clusters
-    judge_ids = MapJudgeToCluster.objects.filter(clusterid__in=cluster_ids).values_list('judgeid', flat=True).distinct()
+    judge_ids = judge_cluster_assignments_for_contest(contest_id).values_list('judgeid', flat=True).distinct()
     
     # Get the judge objects
     judges = Judge.objects.filter(id__in=judge_ids).distinct()
     serializer = JudgeSerializer(judges, many=True)
     return Response({"Judges": serializer.data}, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def get_public_judge_count_by_contest_id(request, contest_id):
+    """Return only the number of assigned judges for public contest highlights."""
+    if not Contest.objects.filter(id=contest_id).exists():
+        return Response({"detail": "Contest not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    judge_count = judge_cluster_assignments_for_contest(contest_id).values(
+        "judgeid"
+    ).distinct().count()
+    return Response({"judge_count": judge_count}, status=status.HTTP_200_OK)
 
 
 @api_view(['GET'])
@@ -81,8 +101,12 @@ def get_contest_id_by_judge_id(request, judge_id):
     contest = Contest.objects.get(id=contest_id)
     serializer = ContestSerializer(instance=contest)
     return Response({"Contest": serializer.data}, status=status.HTTP_200_OK)
-  except Exception as e:
-    return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+  except Exception:
+    logger.exception("Unexpected error while loading contest for judge")
+    return Response(
+        {"error": "Unable to load the judge's contest due to a server error."},
+        status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    )
 
 @api_view(["DELETE"])
 @authentication_classes([SessionAuthentication])

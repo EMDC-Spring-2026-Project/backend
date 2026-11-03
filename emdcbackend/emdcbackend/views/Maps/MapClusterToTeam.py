@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework import status
 from rest_framework.decorators import (
     api_view,
@@ -5,6 +7,8 @@ from rest_framework.decorators import (
     permission_classes,
 )
 from rest_framework.exceptions import ValidationError
+
+logger = logging.getLogger(__name__)
 from rest_framework.response import Response
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
@@ -66,8 +70,12 @@ def teams_by_cluster_id(request, cluster_id):
             team["map_id"] = mapping.id if mapping else None
 
         return Response({"Teams": serialized_teams}, status=status.HTTP_200_OK)
-    except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading teams by cluster %s", cluster_id)
+        return Response(
+            {"detail": "Unable to load cluster teams due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 @api_view(["GET"])
@@ -84,8 +92,12 @@ def cluster_by_team_id(request, team_id):
         return Response({"Clusters": serializer.data}, status=status.HTTP_200_OK)
     except JudgeClusters.DoesNotExist:
         return Response({"error": "One or more clusters not found for the given IDs"}, status=status.HTTP_404_NOT_FOUND)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading clusters for team %s", team_id)
+        return Response(
+            {"error": "Unable to load team clusters due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 @api_view(["DELETE"])
@@ -109,8 +121,12 @@ def delete_cluster_team_mapping_by_id(request, map_id):
                     serializer.save()
 
         return Response({"detail": "Team removed from cluster and moved to All Teams."}, status=status.HTTP_200_OK)
-    except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while removing team from cluster")
+        return Response(
+            {"detail": "Unable to update the cluster assignment due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 @api_view(["GET"])
@@ -153,8 +169,12 @@ def teams_by_judge_id(request, judge_id):
         serializer = TeamSerializer(teams, many=True)
 
         return Response({"Teams": serializer.data}, status=status.HTTP_200_OK)
-    except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading teams for judge %s", judge_id)
+        return Response(
+            {"detail": "Unable to load judge teams due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 def create_team_to_cluster_map(map_data):

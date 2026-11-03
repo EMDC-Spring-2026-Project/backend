@@ -2,6 +2,7 @@ from django.urls import reverse
 from rest_framework.test import APITestCase
 from rest_framework import status
 from django.contrib.auth.models import User
+from unittest.mock import patch
 from datetime import date
 from ..models import (
     Admin, Contest, JudgeClusters, MapContestToCluster, MapUserToRole,
@@ -55,6 +56,22 @@ class ContestAPITests(APITestCase):
         self.assertEqual(response.data['contest']['name'], "New Contest")
         self.assertTrue(Contest.objects.filter(name="New Contest").exists())
 
+    @patch("emdcbackend.views.contest.map_cluster_to_contest", side_effect=RuntimeError("sensitive database detail"))
+    def test_create_contest_hides_internal_error_and_rolls_back(self, _mock_mapping):
+        initial_counts = (Contest.objects.count(), JudgeClusters.objects.count())
+        response = self.client.post(
+            reverse('create_contest'),
+            {"name": "Failed Setup", "date": str(date.today())},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(
+            response.data["detail"],
+            "Unable to create the contest due to an unexpected server error.",
+        )
+        self.assertNotIn("sensitive database detail", str(response.data))
+        self.assertEqual((Contest.objects.count(), JudgeClusters.objects.count()), initial_counts)
+
     def test_edit_contest(self):
         contest = Contest.objects.create(
             name="Original Contest",
@@ -94,6 +111,37 @@ class ContestAPITests(APITestCase):
         self.assertTrue(contest.is_open)
         self.assertFalse(contest.is_tabulated)
 
+    def test_results_require_separate_publish_action(self):
+        contest = Contest.objects.create(
+            name="Ready Contest", date=date.today(),
+            is_open=False, is_tabulated=True,
+        )
+        self.assertFalse(contest.results_published)
+
+        response = self.client.post(
+            reverse("publish_contest_results", args=[contest.id]),
+            {"published": True}, format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        contest.refresh_from_db()
+        self.assertTrue(contest.results_published)
+
+    def test_results_cannot_publish_before_close_and_tabulation(self):
+        contest = Contest.objects.create(
+            name="Active Contest", date=date.today(),
+            is_open=True, is_tabulated=False,
+        )
+
+        response = self.client.post(
+            reverse("publish_contest_results", args=[contest.id]),
+            {"published": True}, format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        contest.refresh_from_db()
+        self.assertFalse(contest.results_published)
+
     def test_delete_contest(self):
         contest = Contest.objects.create(
             name="To Delete",
@@ -110,6 +158,24 @@ class ContestAPITests(APITestCase):
         response = self.client.delete(reverse('delete_contest', args=[999999]))
 
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @patch.object(Contest, "delete", side_effect=RuntimeError("sensitive database detail"))
+    def test_delete_contest_hides_internal_error_and_rolls_back(self, _mock_delete):
+        contest = Contest.objects.create(
+            name="Protected from partial deletion",
+            date=date.today(),
+            is_open=True,
+            is_tabulated=False,
+        )
+        response = self.client.delete(reverse('delete_contest', args=[contest.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(
+            response.data["detail"],
+            "Unable to delete the contest due to an unexpected server error.",
+        )
+        self.assertNotIn("sensitive database detail", str(response.data))
+        self.assertTrue(Contest.objects.filter(id=contest.id).exists())
 
     def test_delete_contest_preserves_data_shared_with_another_contest(self):
         contest = Contest.objects.create(

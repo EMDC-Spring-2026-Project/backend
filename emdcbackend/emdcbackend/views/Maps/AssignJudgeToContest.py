@@ -3,6 +3,8 @@ API endpoint to assign an existing judge to additional contests.
 This allows the same judge to work on multiple contests.
 """
 
+import logging
+
 from rest_framework import status
 from rest_framework.decorators import (
     api_view,
@@ -14,6 +16,7 @@ from rest_framework.response import Response
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
 
 from ...models import MapContestToJudge, Judge, Contest, MapJudgeToCluster, MapContestToTeam, MapContestToCluster, MapContestToOrganizer, MapScoresheetToTeamJudge, Scoresheet, MapClusterToTeam, MapUserToRole
@@ -21,6 +24,8 @@ from ...serializers import JudgeSerializer
 from .MapContestToJudge import create_contest_to_judge_map
 from ...views.Maps.MapClusterToJudge import map_cluster_to_judge
 from ..judge import sync_judge_sheet_flags
+
+logger = logging.getLogger(__name__)
 
 
 def _can_manage_contest(user, contest_id):
@@ -67,6 +72,25 @@ def assign_judge_to_contest(request):
                 {"error": "judge_id, contest_id, and cluster_id are required"}, 
                 status=status.HTTP_400_BAD_REQUEST
             )
+        if any(isinstance(value, bool) for value in (judge_id, contest_id, cluster_id)):
+            return Response(
+                {"error": "judge_id, contest_id, and cluster_id must be positive integers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            judge_id, contest_id, cluster_id = map(
+                int, (judge_id, contest_id, cluster_id)
+            )
+        except (TypeError, ValueError):
+            return Response(
+                {"error": "judge_id, contest_id, and cluster_id must be positive integers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if min(judge_id, contest_id, cluster_id) <= 0:
+            return Response(
+                {"error": "judge_id, contest_id, and cluster_id must be positive integers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if not _can_manage_contest(request.user, contest_id):
             return Response({"error": "You are not allowed to manage this contest."}, status=status.HTTP_403_FORBIDDEN)
         if not MapContestToCluster.objects.filter(contestid=contest_id, clusterid=cluster_id).exists():
@@ -90,6 +114,21 @@ def assign_judge_to_contest(request):
             judgeid=judge_id,
             clusterid=cluster_id
         ).first()
+
+        if (
+            existing_cluster_mapping
+            and existing_cluster_mapping.contestid is not None
+            and existing_cluster_mapping.contestid != contest_id
+        ):
+            return Response(
+                {
+                    "error": (
+                        "This judge is already assigned to the shared cluster for "
+                        "another contest. Use a separate cluster for this contest."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         
         if existing_contest_mapping and existing_cluster_mapping:
             return Response(
@@ -218,8 +257,12 @@ def assign_judge_to_contest(request):
         
     except ValidationError as e:
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while assigning judge to contest")
+        return Response(
+            {"error": "Unable to assign judge due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 @api_view(["GET"])
@@ -256,10 +299,13 @@ def get_judge_contests(request, judge_id):
         organizer_ids = MapUserToRole.objects.filter(
             uuid=request.user.id, role=MapUserToRole.RoleEnum.ORGANIZER
         ).values_list("relatedid", flat=True)
-        manages_assigned_contest = MapContestToOrganizer.objects.filter(
+        managed_contest_ids = set(MapContestToOrganizer.objects.filter(
             contestid__in=contest_ids, organizerid__in=organizer_ids
-        ).exists()
-        if not (is_admin or is_self or manages_assigned_contest):
+        ).values_list("contestid", flat=True))
+        manages_assigned_contests = bool(contest_ids) and set(contest_ids).issubset(
+            managed_contest_ids
+        )
+        if not (is_admin or is_self or manages_assigned_contests):
             return Response(
                 {"error": "You are not allowed to view this judge's contests."},
                 status=status.HTTP_403_FORBIDDEN,
@@ -277,8 +323,12 @@ def get_judge_contests(request, judge_id):
             "contests": contest_serializer.data
         }, status=status.HTTP_200_OK)
         
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading judge contests")
+        return Response(
+            {"error": "Unable to load judge contests due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 @api_view(["DELETE"])
@@ -302,27 +352,52 @@ def remove_judge_from_contest(request, judge_id, contest_id):
                 status=status.HTTP_404_NOT_FOUND,
             )
         
-        # Limit cleanup to clusters belonging to the contest being removed.
-        # A judge can work in multiple contests, so selecting their first
-        # cluster assignment could otherwise remove work from another contest.
-        contest_cluster_ids = MapContestToCluster.objects.filter(
+        # Limit cleanup to this contest's judge-cluster assignments. A cluster
+        # shared with another contest is a shared object, so modifying its judge
+        # assignment requires access to every contest that uses the cluster.
+        contest_cluster_ids = list(MapContestToCluster.objects.filter(
             contestid=contest_id
-        ).values_list("clusterid", flat=True)
+        ).values_list("clusterid", flat=True))
         cluster_mappings = MapJudgeToCluster.objects.filter(
             judgeid=judge_id, clusterid__in=contest_cluster_ids
-        )
+        ).filter(Q(contestid=contest_id) | Q(contestid__isnull=True))
+        affected_contest_ids = MapContestToCluster.objects.filter(
+            clusterid__in=cluster_mappings.values_list("clusterid", flat=True)
+        ).values_list("contestid", flat=True).distinct()
+        if any(
+            not _can_manage_contest(request.user, affected_contest_id)
+            for affected_contest_id in affected_contest_ids
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "You can remove this judge only if you manage every contest "
+                        "using the judge's shared cluster. Ask an administrator if "
+                        "another contest also uses it."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
         
         with transaction.atomic():
             # Clean up scoresheets for this judge-contest combination
             if cluster_mappings.exists():
                 # Get all teams in the contest
                 contest_teams = MapContestToTeam.objects.filter(contestid=contest_id)
-                team_ids = contest_teams.values_list('teamid', flat=True)
+                team_ids = list(contest_teams.values_list('teamid', flat=True))
+                # A team's scoresheets are shared records. Preserve them when the
+                # team is also assigned to another contest.
+                shared_team_ids = set(MapContestToTeam.objects.filter(
+                    teamid__in=team_ids
+                ).exclude(contestid=contest_id).values_list("teamid", flat=True))
+                exclusive_team_ids = [
+                    team_id for team_id in team_ids if team_id not in shared_team_ids
+                ]
 
                 # Delete scoresheets for this judge and contest teams
                 scoresheet_mappings = MapScoresheetToTeamJudge.objects.filter(
                     judgeid=judge_id,
-                    teamid__in=team_ids
+                    teamid__in=exclusive_team_ids
                 )
                 scoresheet_ids = list(
                     scoresheet_mappings.values_list('scoresheetid', flat=True)
@@ -351,8 +426,12 @@ def remove_judge_from_contest(request, judge_id, contest_id):
             }
         }, status=status.HTTP_200_OK)
         
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while removing judge from contest")
+        return Response(
+            {"error": "Unable to remove judge from contest due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 @api_view(["DELETE"])
@@ -365,11 +444,21 @@ def remove_judge_from_cluster(request, judge_id, cluster_id):
     If the judge is no longer in any clusters for the contest, also remove the contest-judge mapping.
     """
     try:
-        contest_cluster_mapping = MapContestToCluster.objects.filter(clusterid=cluster_id).first()
-        contest_id = contest_cluster_mapping.contestid if contest_cluster_mapping else None
-        if not contest_id or not _can_manage_contest(request.user, contest_id):
+        contest_ids = list(MapContestToCluster.objects.filter(
+            clusterid=cluster_id
+        ).values_list("contestid", flat=True))
+        if not contest_ids or any(
+            not _can_manage_contest(request.user, contest_id)
+            for contest_id in contest_ids
+        ):
             return Response(
-                {"error": "You are not allowed to manage this contest."},
+                {
+                    "detail": (
+                        "You can remove a judge from this cluster only if you manage "
+                        "every contest it belongs to. Ask an administrator if the "
+                        "cluster is shared with another contest."
+                    )
+                },
                 status=status.HTTP_403_FORBIDDEN,
             )
 
@@ -380,6 +469,13 @@ def remove_judge_from_cluster(request, judge_id, cluster_id):
             return Response(
                 {"error": f"Judge {judge_id} is not assigned to cluster {cluster_id}"},
                 status=status.HTTP_404_NOT_FOUND,
+            )
+
+        contest_id = cluster_mapping.contestid or contest_ids[0]
+        if contest_id not in contest_ids:
+            return Response(
+                {"detail": "Judge assignment is not linked to this cluster's contest."},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         with transaction.atomic():
@@ -411,7 +507,9 @@ def remove_judge_from_cluster(request, judge_id, cluster_id):
             }
         }, status=status.HTTP_200_OK)
         
-    except Exception as e:
-        return Response({
-            "error": f"Failed to remove judge from cluster: {str(e)}"
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while removing judge from cluster")
+        return Response(
+            {"error": "Unable to remove judge from cluster due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )

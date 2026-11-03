@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework import status
 from rest_framework.decorators import (
   api_view,
@@ -11,6 +13,8 @@ from rest_framework.exceptions import ValidationError, PermissionDenied
 from django.shortcuts import get_object_or_404
 from ...models import MapContestToOrganizer, Organizer, Contest, MapUserToRole
 from ...serializers import MapContestToOrganizerSerializer, ContestSerializer, OrganizerSerializer
+
+logger = logging.getLogger(__name__)
 
 
 def _is_admin(user):
@@ -32,8 +36,12 @@ def create_contest_organizer_mapping(request):
     except ValidationError as e:
         return Response({"errors": e.detail}, status=status.HTTP_400_BAD_REQUEST)
 
-    except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while creating contest-organizer mapping")
+        return Response(
+            {"detail": "Unable to save the organizer assignment due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 def map_contest_to_organizer(map_data):
     serializer = MapContestToOrganizerSerializer(data=map_data)
@@ -135,8 +143,12 @@ def get_all_contests_by_organizer(request):
 
         return Response(organizer_contests, status=status.HTTP_200_OK)
 
-    except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading contests by organizer")
+        return Response(
+            {"detail": "Unable to load organizer contests due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 @api_view(["GET"])
 @authentication_classes([SessionAuthentication])
@@ -169,8 +181,12 @@ def get_organizer_names_by_contests(request):
 
         return Response(contest_organizer_mapping, status=status.HTTP_200_OK)
 
-    except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading organizer names by contest")
+        return Response(
+            {"detail": "Unable to load organizer information due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 # endpoint that returns all the contests and their organizers

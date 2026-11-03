@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework import status
 from rest_framework.decorators import (
     api_view,
@@ -26,6 +28,9 @@ from ..auth.views import delete_user_by_id
 from django.contrib.auth import get_user_model
 from ..auth.password_utils import send_set_password_email
 from django.contrib.sessions.models import Session
+
+
+logger = logging.getLogger(__name__)
 
 
 def _can_manage_team(user, team_id):
@@ -102,8 +107,12 @@ def create_organizer(request):
     except ValidationError as e:  # Catching ValidationErrors specifically
         return Response({"errors": e.detail}, status=status.HTTP_400_BAD_REQUEST)
   
-    except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while creating organizer")
+        return Response(
+            {"detail": "Unable to create the organizer due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 def create_user_and_organizer(data):
     # IMPORTANT: Organizers use ONLY the shared organizer password (role=2)
@@ -204,8 +213,12 @@ def edit_organizer(request):
         return Response({"error": "Organizer not found."}, status=status.HTTP_404_NOT_FOUND)
     except Http404:
         return Response({"error": "Organizer not found."}, status=status.HTTP_404_NOT_FOUND)
-    except Exception as e:
-        return Response({"error": f"An error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while editing organizer %s", request.data.get("id"))
+        return Response(
+            {"detail": "Unable to update organizer due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 def _delete_user_sessions(user_id: int) -> None:
@@ -268,8 +281,12 @@ def delete_organizer(request, organizer_id):
         return Response({"error": "Organizer not found."}, status=status.HTTP_404_NOT_FOUND)
     except MapUserToRole.DoesNotExist:
         return Response({"error": "Organizer mapping not found."}, status=status.HTTP_404_NOT_FOUND)
-    except Exception as e:
-        return Response({"error": f"An error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while deleting organizer %s", organizer_id)
+        return Response(
+            {"detail": "Unable to delete the organizer due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 # return all organizers
@@ -285,48 +302,12 @@ def get_all_organizers(request):
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def organizer_disqualify_team(request):
-    team_id = request.data.get("teamid")
-    if team_id is None or "organizer_disqualified" not in request.data:
-        return Response({"detail": "teamid and organizer_disqualified are required."}, status=status.HTTP_400_BAD_REQUEST)
-    team = get_object_or_404(Teams, id=team_id)
-    if not _can_manage_team(request.user, team.id):
-        return Response(
-            {
-                "detail": (
-                    "You can disqualify this team only if you manage every contest it "
-                    "belongs to. Ask an administrator if the team is shared with "
-                    "another contest."
-                )
-            },
-            status=status.HTTP_403_FORBIDDEN,
-        )
-    disqualified = request.data["organizer_disqualified"]
-    if isinstance(disqualified, str):
-        normalized = disqualified.strip().lower()
-        if normalized not in ("true", "false"):
-            return Response(
-                {"detail": "organizer_disqualified must be true or false."},
-                status=status.HTTP_400_BAD_REQUEST,
+    return Response(
+        {
+            "detail": (
+                "Only an assigned judge may disqualify a team. Organizers can "
+                "review the result but cannot create or reverse a disqualification."
             )
-        disqualified = normalized == "true"
-    if not isinstance(disqualified, bool):
-        return Response(
-            {"detail": "organizer_disqualified must be true or false."},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-    with transaction.atomic():
-        team.organizer_disqualified = disqualified
-        if team.judge_disqualified and team.organizer_disqualified:
-            team.cluster_rank = None
-            team.team_rank = None
-            scoresheet_ids = MapScoresheetToTeamJudge.objects.filter(
-                teamid=team.id
-            ).values_list("scoresheetid", flat=True)
-            # A stale mapping should not prevent the valid sheets and team from
-            # being finalized.
-            Scoresheet.objects.filter(id__in=scoresheet_ids).update(
-                isSubmitted=True
-            )
-        team.save()
-    serializer = TeamSerializer(team)
-    return Response({"team": serializer.data}, status=status.HTTP_200_OK)
+        },
+        status=status.HTTP_403_FORBIDDEN,
+    )

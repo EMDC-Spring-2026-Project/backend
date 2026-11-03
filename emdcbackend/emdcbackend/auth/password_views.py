@@ -6,15 +6,36 @@ from django.conf import settings
 from django.shortcuts import get_object_or_404
 from django.utils.http import urlsafe_base64_decode
 from django.utils.encoding import force_str
-from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.decorators import (
+    api_view,
+    authentication_classes,
+    permission_classes,
+    throttle_classes,
+)
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.throttling import SimpleRateThrottle
+import logging
 import os
 
 from .password_utils import build_set_password_url
 from .utils import send_email_via_resend
+
+logger = logging.getLogger(__name__)
+
+
+class PasswordResetRateThrottle(SimpleRateThrottle):
+    """Limit password-reset email requests by client IP, including logged-in clients."""
+
+    scope = "password_reset"
+
+    def get_cache_key(self, request, view):
+        return self.cache_format % {
+            "scope": self.scope,
+            "ident": self.get_ident(request),
+        }
 
 
 # 1) Admin-only re-sends a set-password email (auth required)
@@ -131,9 +152,10 @@ EMDC Contest Management System
 
 
 # 2) Public "Forgot Password" - Admin and Coach only
-# Note: In production, add rate limiting to prevent abuse
+# This endpoint is rate-limited because each accepted request can send email.
 @api_view(["POST"])
 @permission_classes([AllowAny])
+@throttle_classes([PasswordResetRateThrottle])
 def request_password_reset(request):
     """
     Body: { "username": "<email>" }
@@ -239,12 +261,14 @@ EMDC Contest Management System
             text_content=text_content
         )
     except Exception as e:
-        # Log the error but don't expose internal details to user
-        print(f"[ERROR] Failed to send password reset email: {e}")
-        return Response({
-            "detail": "Failed to send password reset email. Please check your email configuration or contact support.",
-            "error": "Email sending failed."
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        # Keep the public response identical to unknown/ineligible accounts.
+        # Otherwise the email provider's failure would reveal that this address
+        # belongs to an eligible account.
+        logger.exception("Failed to send password reset email")
+        return Response(
+            {"detail": "If this email belongs to an admin or coach, a reset link has been sent."},
+            status=status.HTTP_200_OK,
+        )
     
     return Response({"detail": "If this email belongs to an admin or coach, a reset link has been sent."}, status=status.HTTP_200_OK)
 

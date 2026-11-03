@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework import status
 from rest_framework.decorators import (
     api_view,
@@ -19,6 +21,8 @@ from ..models import MapUserToRole
 from ..auth.views import User, delete_user
 from ..auth.password_utils import send_set_password_email
 from django.contrib.sessions.models import Session
+
+logger = logging.getLogger(__name__)
 
 
 def _is_admin(user):
@@ -113,16 +117,21 @@ def delete_coach(request, coach_id):
     try:
         if not _is_admin(request.user):
             return Response({"detail": "Administrator access required."}, status=status.HTTP_403_FORBIDDEN)
-        coach = get_object_or_404(Coach, id=coach_id)
-        coach_mapping = MapUserToRole.objects.get(role=MapUserToRole.RoleEnum.COACH, relatedid=coach_id)
-        user_id = coach_mapping.uuid
-        
-        # Invalidate all active sessions for this user before deleting user
-        _delete_user_sessions(user_id)
-        
-        coach.delete()
-        coach_mapping.delete()
-        delete_user(user_id)
+        with transaction.atomic():
+            coach = get_object_or_404(Coach, id=coach_id)
+            coach_mapping = MapUserToRole.objects.get(
+                role=MapUserToRole.RoleEnum.COACH, relatedid=coach_id
+            )
+            user_id = coach_mapping.uuid
+
+            coach.delete()
+            coach_mapping.delete()
+            delete_user(user_id)
+            transaction.on_commit(
+                lambda deleted_user_id=user_id: _delete_user_sessions(
+                    deleted_user_id
+                )
+            )
         return Response({"Detail": "Coach deleted successfully."}, status=status.HTTP_200_OK)
     except Coach.DoesNotExist:
         return Response({"error": "Coach not found."}, status=status.HTTP_404_NOT_FOUND)
@@ -130,8 +139,12 @@ def delete_coach(request, coach_id):
         return Response({"error": "Coach not found."}, status=status.HTTP_404_NOT_FOUND)
     except MapUserToRole.DoesNotExist:
         return Response({"error": "Coach mapping not found."}, status=status.HTTP_404_NOT_FOUND)
-    except Exception as e:
-        return Response({"error": f"An error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while deleting coach %s", coach_id)
+        return Response(
+            {"error": "Unable to delete coach due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 def create_coach_instance(coach_data):
     serializer = CoachSerializer(data=coach_data)

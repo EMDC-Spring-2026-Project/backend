@@ -1,3 +1,6 @@
+import logging
+import threading
+
 from rest_framework import status
 from rest_framework.decorators import (
     api_view,
@@ -10,10 +13,44 @@ from rest_framework.permissions import IsAuthenticated
 from django.shortcuts import get_object_or_404
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.http import Http404
+from django.db import models, transaction
 from rest_framework.exceptions import ValidationError
 from .Maps.MapScoreSheet import delete_score_sheet_mapping
+from .contest_utils import judge_cluster_assignments_for_contest
 from ..models import Scoresheet, Teams, Judge, MapClusterToTeam, MapScoresheetToTeamJudge, MapJudgeToCluster, ScoresheetEnum, Contest, MapContestToTeam, MapContestToCluster, MapContestToOrganizer, MapContestToJudge, MapCoachToTeam, MapUserToRole
 from ..serializers import ScoresheetSerializer, MapScoreSheetToTeamJudgeSerializer
+
+logger = logging.getLogger(__name__)
+
+
+def _schedule_tabulation_for_team(team_id):
+    """Recalculate results for every contest that contains a shared team."""
+    contest_ids = list(
+        MapContestToTeam.objects.filter(teamid=team_id)
+        .values_list("contestid", flat=True)
+        .distinct()
+    )
+    if not contest_ids:
+        return
+
+    def recalculate_contests():
+        from .tabulation import recompute_totals_and_ranks
+
+        for contest_id in contest_ids:
+            try:
+                recompute_totals_and_ranks(contest_id)
+            except Exception:
+                logger.exception(
+                    "Unexpected error while recalculating results for contest %s",
+                    contest_id,
+                )
+
+    try:
+        threading.Thread(target=recalculate_contests, daemon=True).start()
+    except Exception:
+        # Saving the score is already committed; report scheduling failures to
+        # logs without turning a successful score submission into a false error.
+        logger.exception("Unable to schedule result recalculation for team %s", team_id)
 
 
 def _parse_boolean(value, field_name="value"):
@@ -64,6 +101,41 @@ def _is_admin(user):
     return user.is_superuser or MapUserToRole.objects.filter(
         uuid=user.id, role=MapUserToRole.RoleEnum.ADMIN
     ).exists()
+
+
+def _judge_scoresheet_is_locked(user, scoresheet):
+    """Return True when a judge tries to change a sheet for a closed contest."""
+    judge_ids = set(MapUserToRole.objects.filter(
+        uuid=user.id, role=MapUserToRole.RoleEnum.JUDGE
+    ).values_list("relatedid", flat=True))
+    if not judge_ids:
+        return False
+
+    mappings = MapScoresheetToTeamJudge.objects.filter(
+        scoresheetid=scoresheet.id, judgeid__in=judge_ids
+    )
+    if not mappings.exists():
+        return False
+
+    team_ids = mappings.values_list("teamid", flat=True)
+    contest_ids = MapContestToTeam.objects.filter(
+        teamid__in=team_ids
+    ).values_list("contestid", flat=True)
+    assigned_contest_ids = MapContestToJudge.objects.filter(
+        judgeid__in=judge_ids, contestid__in=contest_ids
+    ).values_list("contestid", flat=True)
+    return Contest.objects.filter(id__in=assigned_contest_ids).filter(
+        models.Q(is_open=False) | models.Q(is_tabulated=True)
+    ).exists()
+
+
+def _locked_scoresheet_response(user, scoresheet):
+    if _judge_scoresheet_is_locked(user, scoresheet):
+        return Response(
+            {"detail": "Scores cannot be changed after the contest is closed."},
+            status=status.HTTP_409_CONFLICT,
+        )
+    return None
 
 
 def _can_view_contest_scores(user, contest_id, judge_id):
@@ -153,6 +225,9 @@ def edit_score_sheet(request):
         scores = get_object_or_404(Scoresheet, id=scores_id)
         if not _can_edit_scoresheet(request.user, scores):
             return Response({"detail": "You cannot edit this scoresheet."}, status=status.HTTP_403_FORBIDDEN)
+        locked_response = _locked_scoresheet_response(request.user, scores)
+        if locked_response:
+            return locked_response
 
         requested_sheet_type = request.data.get("sheetType", scores.sheetType)
         try:
@@ -197,27 +272,11 @@ def edit_score_sheet(request):
         # Trigger tabulation recalculation asynchronously for all scoresheet types when submitted
         if scores.isSubmitted:
             try:
-                # Get the team ID from the mapping
                 team_mapping = MapScoresheetToTeamJudge.objects.filter(scoresheetid=scores.id).first()
                 if team_mapping:
-                    # Get the contest ID for this team
-                    contest_mapping = MapContestToTeam.objects.filter(teamid=team_mapping.teamid).first()
-                    if contest_mapping:
-                        # Schedule tabulation asynchronously to avoid blocking the response
-                        import threading
-                        from .tabulation import recompute_totals_and_ranks
-                        
-                        def async_tabulation():
-                            try:
-                                recompute_totals_and_ranks(contest_mapping.contestid)
-                            except Exception as e:
-                                pass
-                        
-                        # Run tabulation in background thread
-                        threading.Thread(target=async_tabulation, daemon=True).start()
-            except Exception as tab_error:
-                # Don't fail the request if tabulation fails
-                pass
+                    _schedule_tabulation_for_team(team_mapping.teamid)
+            except Exception:
+                logger.exception("Unable to schedule result recalculation for scoresheet %s", scores.id)
         
         serializer = ScoresheetSerializer(instance=scores)
         return Response({"edit_score_sheets": serializer.data})
@@ -226,7 +285,8 @@ def edit_score_sheet(request):
     except DjangoValidationError as e:
         return Response({"errors": e.message_dict}, status=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        logger.exception("Unexpected error while editing scoresheet %s", scores_id)
+        return Response({"error": "Unable to update the scoresheet."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
@@ -239,6 +299,9 @@ def update_scores(request):
         scores = get_object_or_404(Scoresheet, id=scores_id)
         if not _can_edit_scoresheet(request.user, scores):
             return Response({"detail": "You cannot edit this scoresheet."}, status=status.HTTP_403_FORBIDDEN)
+        locked_response = _locked_scoresheet_response(request.user, scores)
+        if locked_response:
+            return locked_response
         
         if "isSubmitted" in request.data:
             scores.isSubmitted = _parse_boolean(
@@ -276,27 +339,11 @@ def update_scores(request):
         # If this is a championship scoresheet submission, trigger tabulation recalculation asynchronously
         if scores.sheetType == ScoresheetEnum.CHAMPIONSHIP and scores.isSubmitted:
             try:
-                # Get the team ID from the mapping
                 team_mapping = MapScoresheetToTeamJudge.objects.filter(scoresheetid=scores.id).first()
                 if team_mapping:
-                    # Get the contest ID for this team
-                    contest_mapping = MapContestToTeam.objects.filter(teamid=team_mapping.teamid).first()
-                    if contest_mapping:
-                        # Schedule tabulation asynchronously to avoid blocking the response
-                        import threading
-                        from .tabulation import recompute_totals_and_ranks
-                        
-                        def async_tabulation():
-                            try:
-                                recompute_totals_and_ranks(contest_mapping.contestid)
-                            except Exception as e:
-                                pass
-                        
-                        # Run tabulation in background thread
-                        threading.Thread(target=async_tabulation, daemon=True).start()
-            except Exception as tab_error:
-                # Don't fail the request if tabulation fails
-                pass
+                    _schedule_tabulation_for_team(team_mapping.teamid)
+            except Exception:
+                logger.exception("Unable to schedule result recalculation for scoresheet %s", scores.id)
         
         return Response({"updated_sheet": serializer.data})
     except DjangoValidationError as e:
@@ -304,7 +351,8 @@ def update_scores(request):
     except Http404:
         raise
     except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        logger.exception("Unexpected error while updating scoresheet %s", scores_id)
+        return Response({"error": "Unable to update the scoresheet."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
@@ -321,6 +369,9 @@ def edit_score_sheet_field(request):
     sheet = get_object_or_404(Scoresheet, id=scores_id)
     if not _can_edit_scoresheet(request.user, sheet):
         return Response({"detail": "You cannot edit this scoresheet."}, status=status.HTTP_403_FORBIDDEN)
+    locked_response = _locked_scoresheet_response(request.user, sheet)
+    if locked_response:
+        return locked_response
 
     field_name = ""
     if isinstance(field, int):
@@ -354,6 +405,9 @@ def delete_score_sheet(request, scores_id):
     scores = get_object_or_404(Scoresheet, id=scores_id)
     if not _can_edit_scoresheet(request.user, scores):
         return Response({"detail": "You cannot edit this scoresheet."}, status=status.HTTP_403_FORBIDDEN)
+    locked_response = _locked_scoresheet_response(request.user, scores)
+    if locked_response:
+        return locked_response
     scores.delete()
     return Response({"detail": "Score Sheet deleted successfully."}, status=status.HTTP_200_OK)
 
@@ -837,6 +891,31 @@ def delete_sheets_for_teams_in_cluster(judge_id, cluster_id, presentation, journ
         if not team_ids:
             return
         
+        contest_ids = set(MapContestToCluster.objects.filter(
+            clusterid=cluster_id
+        ).values_list("contestid", flat=True))
+        shared_team_ids = set(MapContestToTeam.objects.filter(
+            teamid__in=team_ids
+        ).exclude(contestid__in=contest_ids).values_list("teamid", flat=True))
+        other_cluster_ids = MapJudgeToCluster.objects.filter(
+            judgeid=judge_id
+        ).exclude(clusterid=cluster_id).values_list("clusterid", flat=True)
+        shared_team_ids.update(MapClusterToTeam.objects.filter(
+            clusterid__in=other_cluster_ids, teamid__in=team_ids
+        ).values_list("teamid", flat=True))
+        other_contest_ids = MapContestToCluster.objects.filter(
+            clusterid__in=other_cluster_ids
+        ).values_list("contestid", flat=True)
+        shared_team_ids.update(MapContestToTeam.objects.filter(
+            contestid__in=other_contest_ids, teamid__in=team_ids
+        ).values_list("teamid", flat=True))
+
+        # Scoresheets are linked to a judge and team, not to a cluster or contest.
+        # Keep them when the team is shared outside this cluster's contest(s).
+        team_ids = [team_id for team_id in team_ids if team_id not in shared_team_ids]
+        if not team_ids:
+            return
+
         scoresheet_mappings = MapScoresheetToTeamJudge.objects.filter(
             judgeid=judge_id,
             teamid__in=team_ids
@@ -870,7 +949,12 @@ def delete_sheets_for_teams_in_cluster(judge_id, cluster_id, presentation, journ
         scoresheet_mappings.delete()
         
         if scoresheet_ids:
-            Scoresheet.objects.filter(id__in=scoresheet_ids).delete()
+            still_referenced_ids = MapScoresheetToTeamJudge.objects.filter(
+                scoresheetid__in=scoresheet_ids
+            ).values_list("scoresheetid", flat=True)
+            Scoresheet.objects.filter(id__in=scoresheet_ids).exclude(
+                id__in=still_referenced_ids
+            ).delete()
             
     except Exception as e:
         import traceback
@@ -1208,10 +1292,8 @@ def get_scoresheet_details_for_contest(request):
     team_mappings = MapContestToTeam.objects.filter(contestid=contest.id)
     
     # Get all clusters for this contest
-    contest_cluster_ids = MapContestToCluster.objects.filter(contestid=contest.id).values_list('clusterid', flat=True)
-    
     # Get all judges who are still assigned to clusters in this contest
-    active_judge_ids = MapJudgeToCluster.objects.filter(clusterid__in=contest_cluster_ids).values_list('judgeid', flat=True).distinct()
+    active_judge_ids = judge_cluster_assignments_for_contest(contest.id).values_list('judgeid', flat=True).distinct()
     
     team_responses = {}
     for mapping in team_mappings:
@@ -1633,98 +1715,9 @@ def multi_team_general_penalties(request, judge_id, contest_id):
         
         return Response({'teams': result}, status=status.HTTP_200_OK)
         
-    except Exception as e:
-        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-@api_view(['POST'])
-@authentication_classes([SessionAuthentication])
-@permission_classes([IsAuthenticated])
-def create_missing_championship_scoresheets(request):
-    """
-    Create championship scoresheets for judges who have championship cluster assignments
-    but are missing the corresponding scoresheets. This fixes the issue where advancement
-    happened before the create_scoresheets_for_judges_in_cluster function existed.
-    """
-    try:
-        judge_id = request.data.get('judge_id')
-        if not judge_id:
-            return Response({'error': 'judge_id is required'}, status=status.HTTP_400_BAD_REQUEST)
-
-        judge_id = int(judge_id)
-
-        # Get the judge
-        try:
-            judge = Judge.objects.get(id=judge_id)
-        except Judge.DoesNotExist:
-            return Response({'error': f'Judge {judge_id} not found'}, status=status.HTTP_404_NOT_FOUND)
-
-        created_scoresheets = []
-
-        # Find all championship clusters this judge is assigned to
-        championship_cluster_mappings = MapJudgeToCluster.objects.filter(
-            judgeid=judge_id
-        ).select_related('clusterid')
-
-        championship_clusters = []
-        for mapping in championship_cluster_mappings:
-            try:
-                cluster = JudgeClusters.objects.get(id=mapping.clusterid_id)
-                if (cluster.cluster_type == 'championship' or
-                    'championship' in cluster.cluster_name.lower()):
-                    championship_clusters.append(cluster)
-            except JudgeClusters.DoesNotExist:
-                continue
-
-        # For each championship cluster, create missing scoresheets
-        for cluster in championship_clusters:
-            # Get teams in this cluster
-            team_mappings = MapClusterToTeam.objects.filter(clusterid=cluster.id)
-            team_ids = [tm.teamid for tm in team_mappings]
-
-            # Get teams that have advanced to championship
-            advanced_teams = Teams.objects.filter(
-                id__in=team_ids,
-                advanced_to_championship=True
-            )
-
-            for team in advanced_teams:
-                # Check if championship scoresheet already exists
-                existing_mapping = MapScoresheetToTeamJudge.objects.filter(
-                    teamid=team.id,
-                    judgeid=judge.id,
-                    sheetType=7  # Championship
-                ).first()
-
-                if not existing_mapping:
-                    # Create championship scoresheet
-                    try:
-                        scoresheet = create_base_score_sheet_Championship()
-                        MapScoresheetToTeamJudge.objects.create(
-                            teamid=team.id,
-                            judgeid=judge.id,
-                            scoresheetid=scoresheet.id,
-                            sheetType=7  # Championship
-                        )
-                        created_scoresheets.append({
-                            'team_id': team.id,
-                            'team_name': team.team_name,
-                            'cluster_id': cluster.id,
-                            'cluster_name': cluster.cluster_name,
-                            'scoresheet_id': scoresheet.id
-                        })
-                    except Exception as e:
-                        print(f"Error creating championship scoresheet for judge {judge.id}, team {team.id}: {str(e)}")
-                        continue
-
-        return Response({
-            'message': f'Created {len(created_scoresheets)} championship scoresheets for judge {judge_id}',
-            'created_scoresheets': created_scoresheets
-        }, status=status.HTTP_200_OK)
-
-    except Exception as e:
-        print(f"Error in create_missing_championship_scoresheets: {str(e)}")
-        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading general penalty scoresheets")
+        return Response({'error': 'Unable to load the scoresheets.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @api_view(['GET'])
@@ -1801,26 +1794,41 @@ def multi_team_run_penalties(request, judge_id, contest_id):
         
         return Response({'teams': result}, status=status.HTTP_200_OK)
         
-    except Exception as e:
-        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while loading run penalty scoresheets")
+        return Response({'error': 'Unable to load the scoresheets.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @api_view(['POST'])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def create_missing_championship_scoresheets(request):
     """
     Create championship scoresheets for judges who have championship cluster assignments
     but are missing the corresponding scoresheets. This fixes the issue where advancement
     happened before the create_scoresheets_for_judges_in_cluster function existed.
     """
+    if not _is_admin(request.user):
+        return Response(
+            {"detail": "Administrator access is required."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
     try:
-        judge_id = request.data.get('judge_id')
-        if not judge_id:
-            return Response({'error': 'judge_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        raw_judge_id = request.data.get("judge_id")
+        if isinstance(raw_judge_id, bool):
+            raise ValueError
+        judge_id = int(raw_judge_id)
+        if judge_id <= 0 or str(raw_judge_id).strip() != str(judge_id):
+            raise ValueError
+    except (TypeError, ValueError):
+        return Response(
+            {"detail": "judge_id must be a positive integer."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
-        judge_id = int(judge_id)
-
+    try:
         # Get the judge
         try:
             judge = Judge.objects.get(id=judge_id)
@@ -1832,7 +1840,7 @@ def create_missing_championship_scoresheets(request):
         # Find all championship clusters this judge is assigned to
         championship_cluster_mappings = MapJudgeToCluster.objects.filter(
             judgeid=judge_id
-        ).select_related('clusterid')
+        )
 
         championship_clusters = []
         for mapping in championship_cluster_mappings:
@@ -1881,15 +1889,23 @@ def create_missing_championship_scoresheets(request):
                             'cluster_name': cluster.cluster_name,
                             'scoresheet_id': scoresheet.id
                         })
-                    except Exception as e:
-                        print(f"Error creating championship scoresheet for judge {judge.id}, team {team.id}: {str(e)}")
-                        continue
+                    except Exception:
+                        logger.exception(
+                            "Failed to create championship scoresheet for judge %s and team %s",
+                            judge.id,
+                            team.id,
+                        )
+                        raise
 
         return Response({
             'message': f'Created {len(created_scoresheets)} championship scoresheets for judge {judge_id}',
             'created_scoresheets': created_scoresheets
         }, status=status.HTTP_200_OK)
 
-    except Exception as e:
-        print(f"Error in create_missing_championship_scoresheets: {str(e)}")
-        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        transaction.set_rollback(True)
+        logger.exception("Unexpected error while creating missing championship scoresheets")
+        return Response(
+            {"error": "Unable to create championship scoresheets due to a server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )

@@ -3,6 +3,7 @@ from rest_framework.test import APITestCase
 from rest_framework import status
 from django.contrib.auth.models import User
 from datetime import date
+from unittest.mock import patch
 from ..models import (
     Ballot, Votes, MapBallotToVote, MapVoteToAward, MapTeamToVote, MapAwardToContest,
     Contest, Teams, SpecialAward, Admin, MapUserToRole
@@ -69,6 +70,37 @@ class BallotVoteAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(Ballot.objects.filter(id=ballot.id).exists())
 
+    def test_ballot_creation_hides_unexpected_server_errors(self):
+        with self.assertLogs("emdcbackend.views.ballot", level="ERROR"):
+            with patch(
+                "emdcbackend.views.ballot.BallotSerializer.save",
+                side_effect=RuntimeError("sensitive database detail"),
+            ):
+                response = self.client.post(
+                    reverse("create_ballot"),
+                    {"contestid": self.contest.id, "isSubmitted": False},
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("sensitive database detail", str(response.data))
+
+    def test_ballot_loading_hides_unexpected_server_errors(self):
+        with self.assertLogs("emdcbackend.views.ballot", level="ERROR"):
+            with patch("emdcbackend.views.ballot.BallotSerializer", side_effect=RuntimeError("sensitive database detail")):
+                response = self.client.get(reverse("get_all_ballots"))
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("sensitive database detail", str(response.data))
+
+    def test_ballot_deletion_hides_unexpected_server_errors(self):
+        ballot = Ballot.objects.create(contestid=self.contest.id, isSubmitted=False)
+        with self.assertLogs("emdcbackend.views.ballot", level="ERROR"):
+            with patch("emdcbackend.views.ballot.Ballot.delete", side_effect=RuntimeError("sensitive database detail")):
+                response = self.client.delete(reverse("delete_ballot", args=[ballot.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("sensitive database detail", str(response.data))
+
     # Vote Tests
     def test_create_vote(self):
         url = reverse('create_vote')
@@ -79,6 +111,16 @@ class BallotVoteAPITests(APITestCase):
         self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_201_CREATED])
         self.assertTrue(Votes.objects.filter(votedteamid=self.team.id).exists())
 
+    def test_vote_creation_hides_unexpected_server_errors(self):
+        with self.assertLogs("emdcbackend.views.votes", level="ERROR"):
+            with patch("emdcbackend.views.votes.VotesSerializer.save", side_effect=RuntimeError("sensitive database detail")):
+                response = self.client.post(
+                    reverse("create_vote"), {"votedteamid": self.team.id}
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("sensitive database detail", str(response.data))
+
     def test_get_all_votes(self):
         Votes.objects.create(votedteamid=self.team.id)
         
@@ -86,6 +128,14 @@ class BallotVoteAPITests(APITestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertGreaterEqual(len(response.data.get('votes', [])), 1)
+
+    def test_vote_loading_hides_unexpected_server_errors(self):
+        with self.assertLogs("emdcbackend.views.votes", level="ERROR"):
+            with patch("emdcbackend.views.votes.VotesSerializer", side_effect=RuntimeError("sensitive database detail")):
+                response = self.client.get(reverse("get_all_votes"))
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("sensitive database detail", str(response.data))
 
     # Mapping Tests
     def test_create_map_ballot_to_vote(self):
@@ -101,6 +151,22 @@ class BallotVoteAPITests(APITestCase):
         self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_201_CREATED])
         self.assertTrue(MapBallotToVote.objects.filter(ballotid=ballot.id, voteid=vote.id).exists())
 
+    def test_ballot_vote_link_hides_unexpected_server_errors(self):
+        ballot = Ballot.objects.create(contestid=self.contest.id, isSubmitted=False)
+        vote = Votes.objects.create(votedteamid=self.team.id)
+        with self.assertLogs("emdcbackend.views.Maps.MapBallotToVote", level="ERROR"):
+            with patch(
+                "emdcbackend.views.Maps.MapBallotToVote.MapBallotToVoteSerializer.save",
+                side_effect=RuntimeError("sensitive database detail"),
+            ):
+                response = self.client.post(reverse("create_map_ballot_to_vote"), {
+                    "ballotid": ballot.id,
+                    "voteid": vote.id,
+                })
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("sensitive database detail", str(response.data))
+
     def test_create_map_vote_to_award(self):
         vote = Votes.objects.create(votedteamid=self.team.id)
         
@@ -113,6 +179,21 @@ class BallotVoteAPITests(APITestCase):
         self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_201_CREATED])
         self.assertTrue(MapVoteToAward.objects.filter(voteid=vote.id, awardid=self.award.id).exists())
 
+    def test_vote_award_mapping_hides_unexpected_server_errors(self):
+        vote = Votes.objects.create(votedteamid=self.team.id)
+        with self.assertLogs("emdcbackend.views.Maps.MapVoteToAward", level="ERROR"):
+            with patch(
+                "emdcbackend.views.Maps.MapVoteToAward.MapVoteToAwardSerializer.save",
+                side_effect=RuntimeError("sensitive database detail"),
+            ):
+                response = self.client.post(
+                    reverse("create_map_vote_to_award"),
+                    {"voteid": vote.id, "awardid": self.award.id},
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("sensitive database detail", str(response.data))
+
     def test_create_map_team_to_vote(self):
         vote = Votes.objects.create(votedteamid=self.team.id)
         
@@ -124,6 +205,21 @@ class BallotVoteAPITests(APITestCase):
         response = self.client.post(url, data)
         self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_201_CREATED])
         self.assertTrue(MapTeamToVote.objects.filter(teamid=self.team.id, voteid=vote.id).exists())
+
+    def test_team_vote_mapping_hides_unexpected_server_errors(self):
+        vote = Votes.objects.create(votedteamid=self.team.id)
+        with self.assertLogs("emdcbackend.views.Maps.MapTeamToVote", level="ERROR"):
+            with patch(
+                "emdcbackend.views.Maps.MapTeamToVote.MapTeamToVoteSerializer.save",
+                side_effect=RuntimeError("sensitive database detail"),
+            ):
+                response = self.client.post(
+                    reverse("create_map_team_to_vote"),
+                    {"teamid": self.team.id, "voteid": vote.id},
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("sensitive database detail", str(response.data))
 
     def test_create_map_award_to_contest(self):
         url = reverse('create_map_award_to_contest')

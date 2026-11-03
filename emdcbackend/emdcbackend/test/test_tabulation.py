@@ -3,6 +3,7 @@ from rest_framework.test import APITestCase
 from rest_framework import status
 from django.contrib.auth.models import User
 from datetime import date
+from unittest.mock import patch
 from ..models import (
     Contest, Teams, Judge, JudgeClusters, MapContestToTeam, MapContestToOrganizer,
     MapUserToRole, Organizer, Admin, MapClusterToTeam, MapJudgeToCluster,
@@ -12,6 +13,145 @@ from ..models import (
 
 
 class TabulationAPITests(APITestCase):
+    def test_redesign_total_includes_communication(self):
+        self.cluster.cluster_type = "redesign"
+        self.cluster.save()
+        judge = Judge.objects.create(first_name="Redesign", last_name="Judge", contestid=self.contest.id)
+        MapJudgeToCluster.objects.create(judgeid=judge.id, clusterid=self.cluster.id, redesign=True)
+        sheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.REDESIGN, isSubmitted=True,
+            field1=1, field2=2, field3=3, field4=4, field5=5, field6=6, field7=7,
+        )
+        MapScoresheetToTeamJudge.objects.create(
+            teamid=self.team.id, judgeid=judge.id, scoresheetid=sheet.id,
+            sheetType=ScoresheetEnum.REDESIGN,
+        )
+        response = self.client.put(reverse("tabulate_scores"), {"contestid": self.contest.id}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.team.refresh_from_db()
+        self.assertEqual(self.team.redesign_score, 28)
+
+    def test_redesign_averages_submitted_judges(self):
+        self.cluster.cluster_type = "redesign"
+        self.cluster.save()
+        for index, multiplier in enumerate((1, 2), start=1):
+            judge = Judge.objects.create(
+                first_name=f"Redesign {index}", last_name="Judge",
+                contestid=self.contest.id,
+            )
+            MapJudgeToCluster.objects.create(
+                judgeid=judge.id, clusterid=self.cluster.id,
+                contestid=self.contest.id, redesign=True,
+            )
+            sheet = Scoresheet.objects.create(
+                sheetType=ScoresheetEnum.REDESIGN, isSubmitted=True,
+                **{f"field{number}": number * multiplier for number in range(1, 8)},
+            )
+            MapScoresheetToTeamJudge.objects.create(
+                teamid=self.team.id, judgeid=judge.id, scoresheetid=sheet.id,
+                sheetType=ScoresheetEnum.REDESIGN,
+            )
+
+        response = self.client.put(
+            reverse("tabulate_scores"), {"contestid": self.contest.id}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.team.refresh_from_db()
+        self.assertEqual(self.team.redesign_score, 42)
+
+    def test_penalties_are_averaged_across_judging_groups(self):
+        for index, penalty in enumerate((10, 20), start=1):
+            judge = Judge.objects.create(
+                first_name=f"Penalty {index}", last_name="Judge",
+                contestid=self.contest.id,
+            )
+            MapJudgeToCluster.objects.create(
+                judgeid=judge.id, clusterid=self.cluster.id,
+                contestid=self.contest.id, runpenalties=True, otherpenalties=True,
+            )
+            run_sheet = Scoresheet.objects.create(
+                sheetType=ScoresheetEnum.RUNPENALTIES, isSubmitted=True,
+                **{
+                    f"field{number}": penalty if number == 1 else 0
+                    for number in (*range(1, 9), *range(10, 18))
+                },
+            )
+            other_sheet = Scoresheet.objects.create(
+                sheetType=ScoresheetEnum.OTHERPENALTIES, isSubmitted=True,
+                **{f"field{number}": index for number in range(1, 8)},
+            )
+            for sheet in (run_sheet, other_sheet):
+                MapScoresheetToTeamJudge.objects.create(
+                    teamid=self.team.id, judgeid=judge.id, scoresheetid=sheet.id,
+                    sheetType=sheet.sheetType,
+                )
+
+        response = self.client.put(
+            reverse("tabulate_scores"), {"contestid": self.contest.id}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.team.refresh_from_db()
+        self.assertEqual(self.team.penalties_score, 15)
+        self.assertEqual(self.team.preliminary_penalties_score, 10.5)
+        self.assertEqual(self.team.total_score, -25.5)
+
+    def test_standard_ties_use_machine_then_presentation_then_journal(self):
+        from ..views.tabulation import sort_by_standard_round_tiebreakers
+
+        lower_machine = Teams.objects.create(
+            team_name="Lower Machine", preliminary_total_score=100,
+            preliminary_machinedesign_score=30,
+            preliminary_presentation_score=40, preliminary_journal_score=30,
+        )
+        higher_machine = Teams.objects.create(
+            team_name="Higher Machine", preliminary_total_score=100,
+            preliminary_machinedesign_score=35,
+            preliminary_presentation_score=30, preliminary_journal_score=35,
+        )
+
+        ordered = sort_by_standard_round_tiebreakers(
+            [lower_machine, higher_machine]
+        )
+        self.assertEqual(
+            [team.id for team in ordered], [higher_machine.id, lower_machine.id]
+        )
+
+    def test_redesign_ties_use_first_then_second_category(self):
+        from ..views.tabulation import sort_by_redesign_tiebreakers
+
+        self.cluster.cluster_type = "redesign"
+        self.cluster.save()
+        other_team = Teams.objects.create(team_name="Other Redesign Team", redesign_score=20)
+        self.team.redesign_score = 20
+        self.team.save()
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=other_team.id)
+        MapClusterToTeam.objects.create(clusterid=self.cluster.id, teamid=other_team.id)
+        judge = Judge.objects.create(
+            first_name="Tie", last_name="Judge", contestid=self.contest.id
+        )
+        MapJudgeToCluster.objects.create(
+            judgeid=judge.id, clusterid=self.cluster.id,
+            contestid=self.contest.id, redesign=True,
+        )
+        for team, first, second in (
+            (self.team, 10, 10),
+            (other_team, 12, 8),
+        ):
+            sheet = Scoresheet.objects.create(
+                sheetType=ScoresheetEnum.REDESIGN, isSubmitted=True,
+                field1=first, field2=second, field3=0, field4=0,
+                field5=0, field6=0, field7=0,
+            )
+            MapScoresheetToTeamJudge.objects.create(
+                teamid=team.id, judgeid=judge.id, scoresheetid=sheet.id,
+                sheetType=ScoresheetEnum.REDESIGN,
+            )
+
+        ordered = sort_by_redesign_tiebreakers(
+            [self.team, other_team], self.contest.id
+        )
+        self.assertEqual([team.id for team in ordered], [other_team.id, self.team.id])
+
     def setUp(self):
         # Create a user and login using session authentication
         self.user = User.objects.create_user(username="testuser@example.com", password="testpassword")
@@ -58,6 +198,27 @@ class TabulationAPITests(APITestCase):
         response = self.client.put(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
 
+    @patch("emdcbackend.views.tabulation.recompute_totals_and_ranks")
+    def test_tabulation_rolls_back_partial_updates_when_recalculation_fails(self, recompute):
+        self.team.total_score = 255.0
+        self.team.save()
+
+        def partially_update_then_fail(contest_id):
+            Teams.objects.filter(id=self.team.id).update(total_score=1.0)
+            raise RuntimeError("database detail must not be returned")
+
+        recompute.side_effect = partially_update_then_fail
+        response = self.client.put(
+            reverse("tabulate_scores"),
+            {"contestid": self.contest.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.team.refresh_from_db()
+        self.assertEqual(self.team.total_score, 255.0)
+        self.assertNotIn("database detail", response.data["detail"])
+
     def test_tabulation_ignores_scores_from_judge_not_assigned_to_contest(self):
         other_contest = Contest.objects.create(
             name="Other Contest", date=date.today(), is_open=True, is_tabulated=False
@@ -72,7 +233,7 @@ class TabulationAPITests(APITestCase):
         sheet = Scoresheet.objects.create(
             sheetType=ScoresheetEnum.PRESENTATION,
             isSubmitted=True,
-            **{f"field{number}": 10 for number in range(1, 9)},
+            **{f"field{number}": 1 for number in range(1, 9)},
         )
         MapScoresheetToTeamJudge.objects.create(
             teamid=self.team.id,
@@ -85,6 +246,52 @@ class TabulationAPITests(APITestCase):
             reverse('tabulate_scores'),
             {"contestid": self.contest.id},
             format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.team.refresh_from_db()
+        self.assertEqual(self.team.presentation_score, 0)
+        self.assertEqual(self.team.total_score, 0)
+
+    def test_tabulation_does_not_use_other_contests_judge_in_shared_cluster(self):
+        other_contest = Contest.objects.create(
+            name="Other Contest", date=date.today(), is_open=True, is_tabulated=False
+        )
+        MapContestToCluster.objects.create(
+            contestid=other_contest.id, clusterid=self.cluster.id
+        )
+        MapContestToTeam.objects.create(
+            contestid=other_contest.id, teamid=self.team.id
+        )
+        other_judge = Judge.objects.create(
+            first_name="Other", last_name="Judge", phone_number="5553334444",
+            contestid=other_contest.id, presentation=True,
+        )
+        MapContestToJudge.objects.create(
+            contestid=other_contest.id, judgeid=other_judge.id
+        )
+        MapJudgeToCluster.objects.create(
+            judgeid=other_judge.id,
+            clusterid=self.cluster.id,
+            contestid=other_contest.id,
+            presentation=True,
+        )
+        sheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION,
+            isSubmitted=True,
+            **{f"field{number}": 1 for number in range(1, 9)},
+        )
+        MapScoresheetToTeamJudge.objects.create(
+            teamid=self.team.id,
+            judgeid=other_judge.id,
+            scoresheetid=sheet.id,
+            sheetType=ScoresheetEnum.PRESENTATION,
+        )
+
+        response = self.client.put(
+            reverse("tabulate_scores"),
+            {"contestid": self.contest.id},
+            format="json",
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
@@ -155,6 +362,39 @@ class TabulationAPITests(APITestCase):
         self.assertEqual(len(response.data["data"]), 1)
         self.assertEqual(response.data["data"][0]["cluster_id"], self.cluster.id)
 
+    def test_preliminary_results_excludes_other_contests_teams_in_shared_cluster(self):
+        other_contest = Contest.objects.create(
+            name="Other Contest", date=date.today(), is_open=True, is_tabulated=False
+        )
+        other_team = Teams.objects.create(
+            team_name="Other Contest Team", total_score=999.0
+        )
+        MapContestToCluster.objects.create(
+            contestid=other_contest.id, clusterid=self.cluster.id
+        )
+        MapContestToTeam.objects.create(
+            contestid=other_contest.id, teamid=other_team.id
+        )
+        MapClusterToTeam.objects.create(
+            clusterid=self.cluster.id, teamid=other_team.id
+        )
+
+        response = self.client.put(
+            reverse("preliminary_results"),
+            {"contestid": self.contest.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        cluster_results = next(
+            item for item in response.data["data"]
+            if item["cluster_id"] == self.cluster.id
+        )
+        self.assertEqual(
+            [team["team_id"] for team in cluster_results["teams"]],
+            [self.team.id],
+        )
+
     def test_championship_results(self):
         url = reverse('championship_results')
         url_with_params = f"{url}?contestid={self.contest.id}"
@@ -176,6 +416,28 @@ class TabulationAPITests(APITestCase):
         # Use PUT method (as per view decorator)
         response = self.client.put(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    def test_rejected_disqualified_advancer_keeps_existing_selection(self):
+        self.team.advanced_to_championship = True
+        self.team.championship_rank = 1
+        self.team.save(update_fields=["advanced_to_championship", "championship_rank"])
+        disqualified_team = Teams.objects.create(
+            team_name="Disqualified Team", judge_disqualified=True
+        )
+        MapContestToTeam.objects.create(
+            contestid=self.contest.id, teamid=disqualified_team.id
+        )
+
+        response = self.client.put(
+            reverse("set_advancers"),
+            {"contestid": self.contest.id, "team_ids": [disqualified_team.id]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        self.team.refresh_from_db()
+        self.assertTrue(self.team.advanced_to_championship)
+        self.assertEqual(self.team.championship_rank, 1)
 
     def test_list_advancers(self):
         # Set a team as advanced
@@ -477,8 +739,8 @@ class TabulationAPITests(APITestCase):
         presentation_sheet = Scoresheet.objects.create(
             sheetType=ScoresheetEnum.PRESENTATION,
             isSubmitted=True,
-            field1=10.0, field2=10.0, field3=10.0, field4=10.0,
-            field5=10.0, field6=10.0, field7=10.0, field8=10.0
+            field1=5.0, field2=5.0, field3=5.0, field4=5.0,
+            field5=5.0, field6=5.0, field7=10.0, field8=10.0
         )
         MapScoresheetToTeamJudge.objects.create(
             teamid=self.team.id,
@@ -529,14 +791,14 @@ class TabulationAPITests(APITestCase):
         sheet1 = Scoresheet.objects.create(
             sheetType=ScoresheetEnum.PRESENTATION,
             isSubmitted=True,
-            field1=10.0, field2=10.0, field3=10.0, field4=10.0,
-            field5=10.0, field6=10.0, field7=10.0, field8=10.0
+            field1=2.0, field2=2.0, field3=2.0, field4=2.0,
+            field5=2.0, field6=2.0, field7=4.0, field8=4.0
         )
         sheet2 = Scoresheet.objects.create(
             sheetType=ScoresheetEnum.PRESENTATION,
             isSubmitted=True,
-            field1=20.0, field2=20.0, field3=20.0, field4=20.0,
-            field5=20.0, field6=20.0, field7=20.0, field8=20.0
+            field1=4.0, field2=4.0, field3=4.0, field4=4.0,
+            field5=4.0, field6=4.0, field7=8.0, field8=8.0
         )
         MapScoresheetToTeamJudge.objects.create(
             teamid=self.team.id,
@@ -557,11 +819,11 @@ class TabulationAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         
         self.team.refresh_from_db()
-        # Should average: (80 + 160) / 2 = 120.0
-        self.assertEqual(self.team.presentation_score, 120.0)
+        # Should average: (20 + 40) / 2 = 30.0
+        self.assertEqual(self.team.presentation_score, 30.0)
 
-    def test_tabulate_scores_with_disqualified_teams(self):
-        """Test that disqualified teams are excluded from rankings"""
+    def test_tabulate_scores_places_disqualified_teams_at_bottom(self):
+        """Disqualified teams keep scores but rank below eligible teams."""
         from ..models import MapContestToCluster
         disqualified_team = Teams.objects.create(
             team_name="Disqualified Team",
@@ -572,7 +834,7 @@ class TabulationAPITests(APITestCase):
             redesign_score=0.0,
             total_score=300.0,
             championship_score=0.0,
-            organizer_disqualified=True
+            judge_disqualified=True
         )
         MapContestToTeam.objects.create(contestid=self.contest.id, teamid=disqualified_team.id)
         MapClusterToTeam.objects.create(clusterid=self.cluster.id, teamid=disqualified_team.id)
@@ -583,10 +845,9 @@ class TabulationAPITests(APITestCase):
         response = self.client.put(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         
-        # Disqualified team should not affect rankings of other teams
+        # Disqualified teams remain visible for score review but rank last.
         disqualified_team.refresh_from_db()
-        # Team rank should be None or not set for disqualified teams
-        self.assertIsNone(disqualified_team.team_rank)
+        self.assertEqual(disqualified_team.team_rank, 2)
 
     def test_championship_results_with_penalties(self):
         """Test championship results calculation with penalties"""

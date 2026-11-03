@@ -64,9 +64,9 @@ RUN echo '#!/bin/bash' > /entrypoint.sh && \
     echo '  echo "Creating admin account from environment variables..."' >> /entrypoint.sh && \
     echo '  python manage.py create_first_admin \' >> /entrypoint.sh && \
     echo '    --username "$CREATE_ADMIN_USERNAME" \' >> /entrypoint.sh && \
-    echo '    --password "$CREATE_ADMIN_PASSWORD" \' >> /entrypoint.sh && \
+    echo '    --password-env CREATE_ADMIN_PASSWORD \' >> /entrypoint.sh && \
     echo '    --first-name "${CREATE_ADMIN_FIRST_NAME:-Admin}" \' >> /entrypoint.sh && \
-    echo '    --last-name "${CREATE_ADMIN_LAST_NAME:-User}" || true' >> /entrypoint.sh && \
+    echo '    --last-name "${CREATE_ADMIN_LAST_NAME:-User}"' >> /entrypoint.sh && \
     echo 'fi' >> /entrypoint.sh && \
     echo '' >> /entrypoint.sh && \
     echo 'echo "Starting Django server..."' >> /entrypoint.sh && \
@@ -76,4 +76,4 @@ RUN echo '#!/bin/bash' > /entrypoint.sh && \
 EXPOSE 7004
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["python", "manage.py", "runserver", "0.0.0.0:7004"]
+CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:7004 --workers ${WEB_CONCURRENCY:-3} --access-logfile - --error-logfile - emdcbackend.wsgi:application"]

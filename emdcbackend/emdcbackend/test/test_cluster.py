@@ -4,6 +4,7 @@ from rest_framework import status
 from django.contrib.auth.models import User
 from ..models import JudgeClusters, Admin, Contest, MapContestToCluster, MapUserToRole
 from ..serializers import JudgeClustersSerializer
+from unittest.mock import patch
 
 
 class ClusterAPITests(APITestCase):
@@ -92,6 +93,29 @@ class ClusterAPITests(APITestCase):
         response = self.client.delete(reverse('delete_cluster', args=[999999]))
 
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_cluster_creation_hides_unexpected_server_errors(self):
+        contest = Contest.objects.create(
+            name="Cluster error contest", date="2026-01-01", is_open=True, is_tabulated=False
+        )
+        with self.assertLogs("emdcbackend.views.clusters", level="ERROR"):
+            with patch("emdcbackend.views.clusters.make_cluster", side_effect=RuntimeError("sensitive database detail")):
+                response = self.client.post(
+                    reverse("create_cluster"),
+                    {"cluster_name": "Cluster", "contestid": contest.id},
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("sensitive database detail", str(response.data))
+
+    def test_cluster_deletion_hides_unexpected_server_errors(self):
+        cluster = JudgeClusters.objects.create(cluster_name="Protected from simulated failure")
+        with self.assertLogs("emdcbackend.views.clusters", level="ERROR"):
+            with patch("emdcbackend.models.JudgeClusters.delete", side_effect=RuntimeError("sensitive database detail")):
+                response = self.client.delete(reverse("delete_cluster", args=[cluster.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("sensitive database detail", str(response.data))
 
     def test_unassigned_user_cannot_delete_cluster(self):
         contest = Contest.objects.create(

@@ -1,3 +1,5 @@
+import logging
+
 from django.core.exceptions import FieldError
 from django.shortcuts import get_object_or_404
 from rest_framework import status
@@ -13,6 +15,8 @@ from rest_framework.permissions import IsAuthenticated
 from ...serializers import MapBallotToVoteSerializer
 from ...permissions import is_admin_user
 
+logger = logging.getLogger(__name__)
+
 @api_view(["POST"])
 @authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -25,5 +29,9 @@ def create_map_ballot_to_vote(request):
             serializer.save()
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception:
+        logger.exception("Unexpected error while linking ballot to vote")
+        return Response(
+            {"error": "Unable to link the ballot and vote due to an unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )

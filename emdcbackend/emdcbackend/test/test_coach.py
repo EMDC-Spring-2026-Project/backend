@@ -4,6 +4,7 @@ from rest_framework import status
 from django.contrib.auth.models import User
 from ..models import Coach, MapUserToRole, Admin
 from ..serializers import CoachSerializer
+from unittest.mock import patch
 
 
 class CoachAPITests(APITestCase):
@@ -90,3 +91,25 @@ class CoachAPITests(APITestCase):
         response = self.client.delete(reverse('delete_coach', args=[999999]))
 
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_delete_coach_rolls_back_when_user_deletion_fails(self):
+        coach = Coach.objects.create(first_name="Keep", last_name="Coach")
+        coach_user = User.objects.create_user(
+            username="coach-rollback@example.com", password="password"
+        )
+        mapping = MapUserToRole.objects.create(
+            uuid=coach_user.id, role=4, relatedid=coach.id
+        )
+
+        with self.assertLogs("emdcbackend.views.coach", level="ERROR"):
+            with patch(
+                "emdcbackend.views.coach.delete_user",
+                side_effect=RuntimeError("sensitive database detail"),
+            ):
+                response = self.client.delete(reverse("delete_coach", args=[coach.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn("sensitive database detail", str(response.data))
+        self.assertTrue(Coach.objects.filter(id=coach.id).exists())
+        self.assertTrue(MapUserToRole.objects.filter(id=mapping.id).exists())
+        self.assertTrue(User.objects.filter(id=coach_user.id).exists())
