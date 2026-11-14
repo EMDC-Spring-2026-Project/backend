@@ -87,9 +87,55 @@ class ScoresheetAPITests(APITestCase):
                 self.assertEqual(sheet.field1, 1)
                 self.assertTrue(sheet.isSubmitted)
 
+    def test_final_round_locks_preliminary_sheets_for_all_teams(self):
+        judge_user = User.objects.create_user(username="round-judge")
+        MapUserToRole.objects.create(uuid=judge_user.id, role=3, relatedid=self.judge.id)
+        MapContestToJudge.objects.create(contestid=self.contest.id, judgeid=self.judge.id)
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=self.team.id)
+        advanced_team = Teams.objects.create(team_name="Other team")
+        MapContestToTeam.objects.create(contestid=self.contest.id, teamid=advanced_team.id)
+        cluster = JudgeClusters.objects.create(
+            cluster_name="Finals", cluster_type="championship", is_active=True,
+        )
+        MapContestToCluster.objects.create(contestid=self.contest.id, clusterid=cluster.id)
+        self.client.force_authenticate(user=judge_user)
+
+        sheets = {}
+        for sheet_type in (ScoresheetEnum.JOURNAL, ScoresheetEnum.CHAMPIONSHIP, ScoresheetEnum.REDESIGN):
+            sheet = Scoresheet.objects.create(sheetType=sheet_type, isSubmitted=False, field1=1)
+            MapScoresheetToTeamJudge.objects.create(
+                teamid=self.team.id, judgeid=self.judge.id, scoresheetid=sheet.id,
+                sheetType=sheet_type,
+            )
+            sheets[sheet_type] = sheet
+        journal = sheets[ScoresheetEnum.JOURNAL]
+
+        def edit_field(sheet):
+            return self.client.post(
+                reverse("edit_score_sheet_field"),
+                {"id": sheet.id, "field": 1, "new_value": 2},
+                format="json",
+            )
+
+        self.assertEqual(edit_field(journal).status_code, 200)
+        mapping = MapClusterToTeam.objects.create(clusterid=cluster.id, teamid=advanced_team.id)
+        for endpoint in ("edit_score_sheets", "update_scores"):
+            response = self.client.post(
+                reverse(endpoint), {"id": journal.id, "field1": 3}, format="json"
+            )
+            self.assertEqual(response.status_code, 409, response.data)
+        self.assertEqual(edit_field(journal).status_code, 409)
+        self.assertEqual(self.client.delete(reverse("delete_score_sheets", args=[journal.id])).status_code, 409)
+        journal.refresh_from_db()
+        self.assertEqual(journal.field1, 2)
+        for sheet_type in (ScoresheetEnum.CHAMPIONSHIP, ScoresheetEnum.REDESIGN):
+            self.assertEqual(edit_field(sheets[sheet_type]).status_code, 200)
+        mapping.delete()
+        self.assertEqual(edit_field(journal).status_code, 200)
+
     def test_submitted_shared_team_recalculates_every_contest(self):
         from datetime import date
-        from ..views.scoresheets import _schedule_tabulation_for_team
+        from ..views import scoresheets
         from ..models import Contest
 
         other_contest = Contest.objects.create(
@@ -103,22 +149,24 @@ class ScoresheetAPITests(APITestCase):
             contestid=other_contest.id, teamid=self.team.id
         )
 
-        class ImmediateThread:
-            def __init__(self, target, daemon):
-                self.target = target
-                self.daemon = daemon
+        with (
+            patch.object(scoresheets, "_pending_contests", set()),
+            patch.object(scoresheets, "_tabulation_worker", None),
+            patch.object(scoresheets.threading, "Thread") as worker,
+            patch.object(scoresheets.connections, "close_all"),
+            patch("emdcbackend.views.tabulation.recompute_totals_and_ranks") as recompute,
+        ):
+            with self.captureOnCommitCallbacks(execute=True):
+                for _ in range(24):
+                    scoresheets._schedule_tabulation_for_team(self.team.id)
 
-            def start(self):
-                self.target()
-
-        with patch("emdcbackend.views.scoresheets.threading.Thread", ImmediateThread):
-            with patch(
-                "emdcbackend.views.tabulation.recompute_totals_and_ranks"
-            ) as recompute:
-                _schedule_tabulation_for_team(self.team.id)
-
-        recalculated_ids = {call.args[0] for call in recompute.call_args_list}
-        self.assertEqual(recalculated_ids, {self.contest.id, other_contest.id})
+            worker.assert_called_once()
+            worker.return_value.start.assert_called_once()
+            worker.call_args.kwargs["target"]()
+            self.assertEqual(
+                [call.args[0] for call in recompute.call_args_list],
+                sorted([self.contest.id, other_contest.id]),
+            )
 
     def test_missing_championship_sheets_is_admin_only(self):
         from ..views.scoresheets import create_missing_championship_scoresheets
@@ -497,6 +545,22 @@ class ScoresheetAPITests(APITestCase):
         scoresheet.refresh_from_db()
         self.assertEqual(scoresheet.sheetType, ScoresheetEnum.PRESENTATION)
 
+    def test_edit_score_sheet_field_rejects_fields_from_another_rubric(self):
+        scoresheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=False,
+            field42=None,
+        )
+
+        response = self.client.post(
+            reverse('edit_score_sheet_field'),
+            {"id": scoresheet.id, "field": "field42", "new_value": 10},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        scoresheet.refresh_from_db()
+        self.assertIsNone(scoresheet.field42)
+
     def test_edit_score_sheet_field_returns_validation_error_for_incomplete_submission(self):
         scoresheet = Scoresheet.objects.create(
             sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=False
@@ -515,16 +579,45 @@ class ScoresheetAPITests(APITestCase):
             sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=True,
             **{f"field{number}": 1.0 for number in range(1, 9)},
         )
-
-        response = self.client.post(
-            reverse('edit_score_sheet_field'),
-            {"id": scoresheet.id, "field": "isSubmitted", "new_value": "false"},
-            format='json',
+        MapScoresheetToTeamJudge.objects.create(
+            teamid=self.team.id, judgeid=self.judge.id,
+            scoresheetid=scoresheet.id, sheetType=ScoresheetEnum.PRESENTATION,
         )
+
+        with patch(
+            "emdcbackend.views.scoresheets._schedule_tabulation_for_team"
+        ) as schedule_tabulation:
+            response = self.client.post(
+                reverse('edit_score_sheet_field'),
+                {"id": scoresheet.id, "field": "isSubmitted", "new_value": "false"},
+                format='json',
+            )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         scoresheet.refresh_from_db()
         self.assertFalse(scoresheet.isSubmitted)
+        schedule_tabulation.assert_called_once_with(self.team.id)
+
+    def test_delete_submitted_scoresheet_recalculates_team_results(self):
+        scoresheet = Scoresheet.objects.create(
+            sheetType=ScoresheetEnum.PRESENTATION, isSubmitted=True,
+            **{f"field{number}": 1.0 for number in range(1, 9)},
+        )
+        MapScoresheetToTeamJudge.objects.create(
+            teamid=self.team.id, judgeid=self.judge.id,
+            scoresheetid=scoresheet.id, sheetType=ScoresheetEnum.PRESENTATION,
+        )
+
+        with patch(
+            "emdcbackend.views.scoresheets._schedule_tabulation_for_team"
+        ) as schedule_tabulation:
+            response = self.client.delete(
+                reverse('delete_score_sheets', args=[scoresheet.id])
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertFalse(Scoresheet.objects.filter(id=scoresheet.id).exists())
+        schedule_tabulation.assert_called_once_with(self.team.id)
 
     def test_update_scores(self):
         """Test updating multiple scores in a scoresheet"""

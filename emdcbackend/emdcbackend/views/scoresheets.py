@@ -13,7 +13,7 @@ from rest_framework.permissions import IsAuthenticated
 from django.shortcuts import get_object_or_404
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.http import Http404
-from django.db import models, transaction
+from django.db import connections, models, transaction
 from rest_framework.exceptions import ValidationError
 from .Maps.MapScoreSheet import delete_score_sheet_mapping
 from .contest_utils import judge_cluster_assignments_for_contest
@@ -21,6 +21,34 @@ from ..models import Scoresheet, Teams, Judge, MapClusterToTeam, MapScoresheetTo
 from ..serializers import ScoresheetSerializer, MapScoreSheetToTeamJudgeSerializer
 
 logger = logging.getLogger(__name__)
+
+_tabulation_lock = threading.Lock()
+_pending_contests = set()
+_tabulation_worker = None
+
+
+def _drain_tabulation_queue():
+    global _tabulation_worker
+    from .tabulation import recompute_totals_and_ranks
+
+    while True:
+        with _tabulation_lock:
+            if not _pending_contests:
+                _tabulation_worker = None
+                return
+            contest_ids = sorted(_pending_contests)
+            _pending_contests.clear()
+
+        for contest_id in contest_ids:
+            try:
+                recompute_totals_and_ranks(contest_id)
+            except Exception:
+                logger.exception(
+                    "Unexpected error while recalculating results for contest %s",
+                    contest_id,
+                )
+            finally:
+                connections.close_all()
 
 
 def _schedule_tabulation_for_team(team_id):
@@ -33,24 +61,21 @@ def _schedule_tabulation_for_team(team_id):
     if not contest_ids:
         return
 
-    def recalculate_contests():
-        from .tabulation import recompute_totals_and_ranks
+    def enqueue():
+        global _tabulation_worker
+        with _tabulation_lock:
+            _pending_contests.update(contest_ids)
+            if _tabulation_worker is None:
+                try:
+                    _tabulation_worker = threading.Thread(
+                        target=_drain_tabulation_queue, daemon=True
+                    )
+                    _tabulation_worker.start()
+                except Exception:
+                    _tabulation_worker = None
+                    logger.exception("Unable to start the result recalculation worker")
 
-        for contest_id in contest_ids:
-            try:
-                recompute_totals_and_ranks(contest_id)
-            except Exception:
-                logger.exception(
-                    "Unexpected error while recalculating results for contest %s",
-                    contest_id,
-                )
-
-    try:
-        threading.Thread(target=recalculate_contests, daemon=True).start()
-    except Exception:
-        # Saving the score is already committed; report scheduling failures to
-        # logs without turning a successful score submission into a false error.
-        logger.exception("Unable to schedule result recalculation for team %s", team_id)
+    transaction.on_commit(enqueue)
 
 
 def _parse_boolean(value, field_name="value"):
@@ -103,19 +128,21 @@ def _is_admin(user):
     ).exists()
 
 
-def _judge_scoresheet_is_locked(user, scoresheet):
-    """Return True when a judge tries to change a sheet for a closed contest."""
+def _judge_scoresheet_lock_reason(user, scoresheet):
+    """Explain why an assigned judge can no longer change this sheet."""
+    from ..models import JudgeClusters
+
     judge_ids = set(MapUserToRole.objects.filter(
         uuid=user.id, role=MapUserToRole.RoleEnum.JUDGE
     ).values_list("relatedid", flat=True))
     if not judge_ids:
-        return False
+        return None
 
     mappings = MapScoresheetToTeamJudge.objects.filter(
         scoresheetid=scoresheet.id, judgeid__in=judge_ids
     )
     if not mappings.exists():
-        return False
+        return None
 
     team_ids = mappings.values_list("teamid", flat=True)
     contest_ids = MapContestToTeam.objects.filter(
@@ -124,15 +151,40 @@ def _judge_scoresheet_is_locked(user, scoresheet):
     assigned_contest_ids = MapContestToJudge.objects.filter(
         judgeid__in=judge_ids, contestid__in=contest_ids
     ).values_list("contestid", flat=True)
-    return Contest.objects.filter(id__in=assigned_contest_ids).filter(
+    if Contest.objects.filter(id__in=assigned_contest_ids).filter(
         models.Q(is_open=False) | models.Q(is_tabulated=True)
-    ).exists()
+    ).exists():
+        return "Scores cannot be changed after the contest is closed."
+
+    if scoresheet.sheetType in (ScoresheetEnum.REDESIGN, ScoresheetEnum.CHAMPIONSHIP):
+        return None
+
+    # Advancement activates and fills the final-round clusters. Empty setup
+    # clusters do not close preliminary scoring, and undo clears the mappings.
+    final_clusters = JudgeClusters.objects.filter(is_active=True).filter(
+        models.Q(cluster_type__in=("championship", "redesign"))
+        | models.Q(cluster_name__icontains="championship")
+        | models.Q(cluster_name__icontains="redesign")
+    ).values_list("id", flat=True)
+    for contest_id in set(assigned_contest_ids):
+        cluster_ids = MapContestToCluster.objects.filter(
+            contestid=contest_id, clusterid__in=final_clusters
+        ).values_list("clusterid", flat=True)
+        contest_team_ids = MapContestToTeam.objects.filter(
+            contestid=contest_id
+        ).values_list("teamid", flat=True)
+        if MapClusterToTeam.objects.filter(
+            clusterid__in=cluster_ids, teamid__in=contest_team_ids
+        ).exists():
+            return "Preliminary scores cannot be changed after the final round starts."
+    return None
 
 
 def _locked_scoresheet_response(user, scoresheet):
-    if _judge_scoresheet_is_locked(user, scoresheet):
+    reason = _judge_scoresheet_lock_reason(user, scoresheet)
+    if reason:
         return Response(
-            {"detail": "Scores cannot be changed after the contest is closed."},
+            {"detail": reason},
             status=status.HTTP_409_CONFLICT,
         )
     return None
@@ -379,7 +431,20 @@ def edit_score_sheet_field(request):
     else:
         field_name = field
 
-    allowed_fields = {f"field{number}" for number in range(1, 43)} | {"isSubmitted"}
+    if sheet.sheetType == ScoresheetEnum.OTHERPENALTIES:
+        editable_field_numbers = range(1, 8)
+    elif sheet.sheetType == ScoresheetEnum.REDESIGN:
+        editable_field_numbers = (*range(1, 8), 9)
+    elif sheet.sheetType == ScoresheetEnum.CHAMPIONSHIP:
+        editable_field_numbers = range(1, 43)
+    elif sheet.sheetType == ScoresheetEnum.RUNPENALTIES:
+        editable_field_numbers = range(1, 18)
+    else:
+        editable_field_numbers = range(1, 10)
+
+    allowed_fields = {
+        f"field{number}" for number in editable_field_numbers
+    } | {"isSubmitted"}
     if field_name not in allowed_fields:
         return Response({"error": "Invalid field"}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -394,6 +459,13 @@ def edit_score_sheet_field(request):
         sheet.save()
     except DjangoValidationError as e:
         return Response({"errors": e.message_dict}, status=status.HTTP_400_BAD_REQUEST)
+
+    team_ids = MapScoresheetToTeamJudge.objects.filter(
+        scoresheetid=sheet.id
+    ).values_list("teamid", flat=True).distinct()
+    for team_id in team_ids:
+        _schedule_tabulation_for_team(team_id)
+
     serializer = ScoresheetSerializer(instance=sheet)
     return Response({"score_sheet": serializer.data}, status=status.HTTP_200_OK)
 
@@ -408,7 +480,15 @@ def delete_score_sheet(request, scores_id):
     locked_response = _locked_scoresheet_response(request.user, scores)
     if locked_response:
         return locked_response
+
+    team_ids = list(
+        MapScoresheetToTeamJudge.objects.filter(scoresheetid=scores.id)
+        .values_list("teamid", flat=True)
+        .distinct()
+    )
     scores.delete()
+    for team_id in team_ids:
+        _schedule_tabulation_for_team(team_id)
     return Response({"detail": "Score Sheet deleted successfully."}, status=status.HTTP_200_OK)
 
 def create_score_sheet_helper(map_data):
@@ -763,98 +843,6 @@ def create_score_sheets_for_team(team, judges):
             )
             created_score_sheets.append(score_sheet)
     return created_score_sheets
-
-def create_scoresheets_for_judges_in_cluster(cluster_id):
-    """
-    Create scoresheets for all judges in a cluster when teams are added.
-    This is called after teams are moved to championship/redesign clusters.
-
-    IMPORTANT: Only creates scoresheets appropriate for the cluster type:
-    - Championship clusters: ONLY championship scoresheets (type 7)
-    - Redesign clusters: ONLY redesign scoresheets (type 6)
-    - Preliminary clusters: All scoresheets based on judge flags
-    """
-    try:
-        # Get the cluster to check its type
-        from ..models import JudgeClusters
-        try:
-            cluster = JudgeClusters.objects.get(id=cluster_id)
-            cluster_type = getattr(cluster, 'cluster_type', 'preliminary')
-        except JudgeClusters.DoesNotExist:
-            raise ValidationError({"cluster_id": "Cluster not found."})
-
-        # Get all judges in this cluster
-        judge_mappings = MapJudgeToCluster.objects.filter(clusterid=cluster_id)
-
-        # Get all teams in this cluster
-        team_mappings = MapClusterToTeam.objects.filter(clusterid=cluster_id)
-
-        if len(judge_mappings) == 0:
-            return []
-
-        if len(team_mappings) == 0:
-            return []
-
-        created_scoresheets = []
-
-        for judge_mapping in judge_mappings:
-            try:
-                judge = Judge.objects.get(id=judge_mapping.judgeid)
-
-                # Determine which scoresheets to create based on cluster type
-                if cluster_type == 'championship':
-                    # Championship clusters: ONLY create championship scoresheets (type 7)
-                    # Do NOT create any preliminary scoresheets (1-5) or redesign (6)
-                    sheets = create_sheets_for_teams_in_cluster(
-                        judge.id,
-                        cluster_id,
-                        False,  # presentation
-                        False,  # journal
-                        False,  # mdo
-                        False,  # runpenalties
-                        False,  # otherpenalties
-                        False,  # redesign
-                        True    # championship ONLY
-                    )
-                elif cluster_type == 'redesign':
-                    # Redesign clusters: ONLY create redesign scoresheets (type 6)
-                    # Do NOT create any preliminary scoresheets (1-5) or championship (7)
-                    sheets = create_sheets_for_teams_in_cluster(
-                        judge.id,
-                        cluster_id,
-                        False,  # presentation
-                        False,  # journal
-                        False,  # mdo
-                        False,  # runpenalties
-                        False,  # otherpenalties
-                        True,   # redesign ONLY
-                        False   # championship
-                    )
-                else:
-                    # Preliminary clusters: create all scoresheets based on judge flags
-                    sheets = create_sheets_for_teams_in_cluster(
-                        judge.id,
-                        cluster_id,
-                        judge.presentation,
-                        judge.journal,
-                        judge.mdo,
-                        judge.runpenalties,
-                        judge.otherpenalties,
-                        judge.redesign,
-                        judge.championship
-                    )
-
-                created_scoresheets.extend(sheets)
-
-            except Judge.DoesNotExist:
-                continue
-            except Exception:
-                raise
-
-        return created_scoresheets
-
-    except Exception as e:
-        raise ValidationError({"detail": str(e)})
 
 def get_scoresheet_id(judge_id, team_id, scoresheet_type):
     try:

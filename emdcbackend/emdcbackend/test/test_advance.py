@@ -81,6 +81,42 @@ class AdvanceAPITests(APITestCase):
         self.team.refresh_from_db()
         self.assertTrue(self.team.advanced_to_championship)
 
+    def test_disqualified_team_cannot_advance_or_change_existing_round_state(self):
+        existing_advancer = Teams.objects.create(
+            team_name="Existing Advancer",
+            advanced_to_championship=True,
+            championship_rank=1,
+        )
+        MapContestToTeam.objects.create(
+            contestid=self.contest.id, teamid=existing_advancer.id
+        )
+        MapClusterToTeam.objects.create(
+            clusterid=self.championship_cluster.id, teamid=existing_advancer.id
+        )
+        self.team.judge_disqualified = True
+        self.team.save(update_fields=["judge_disqualified"])
+
+        response = self.client.post(
+            reverse("advance_to_championship"),
+            {
+                "contestid": self.contest.id,
+                "championship_team_ids": [self.team.id],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        self.assertEqual(response.data["team_ids"], [self.team.id])
+        existing_advancer.refresh_from_db()
+        self.assertTrue(existing_advancer.advanced_to_championship)
+        self.assertEqual(existing_advancer.championship_rank, 1)
+        self.assertTrue(
+            MapClusterToTeam.objects.filter(
+                clusterid=self.championship_cluster.id,
+                teamid=existing_advancer.id,
+            ).exists()
+        )
+
     def test_advance_to_championship_missing_contestid(self):
         """Test advance_to_championship with missing contestid"""
         url = reverse('advance_to_championship')

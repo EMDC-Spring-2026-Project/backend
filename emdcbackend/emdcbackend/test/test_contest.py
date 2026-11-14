@@ -142,6 +142,26 @@ class ContestAPITests(APITestCase):
         contest.refresh_from_db()
         self.assertFalse(contest.results_published)
 
+    def test_marking_published_contest_unfinished_withdraws_results(self):
+        contest = Contest.objects.create(
+            name="Published Contest",
+            date=date.today(),
+            is_open=False,
+            is_tabulated=True,
+            results_published=True,
+        )
+
+        response = self.client.post(
+            reverse("edit_contest"),
+            {"id": contest.id, "is_tabulated": False},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        contest.refresh_from_db()
+        self.assertFalse(contest.is_tabulated)
+        self.assertFalse(contest.results_published)
+
     def test_delete_contest(self):
         contest = Contest.objects.create(
             name="To Delete",

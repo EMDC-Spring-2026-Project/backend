@@ -149,8 +149,8 @@ def edit_contest(request):
   contest.date = request.data.get("date", contest.date)
   contest.is_open = request.data.get("is_open", contest.is_open)
   contest.is_tabulated = request.data.get("is_tabulated", contest.is_tabulated)
-  if contest.is_open:
-      # Reopening a round must immediately withdraw any previously released results.
+  if contest.is_open or not contest.is_tabulated:
+      # Results are only public while the contest remains closed and fully tabulated.
       contest.results_published = False
   contest.save()
   serializer = ContestSerializer(instance=contest)
