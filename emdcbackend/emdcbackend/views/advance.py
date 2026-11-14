@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
+from django.db.models import Q
 
 from ..models import (
     Teams,
@@ -48,6 +49,21 @@ def advance_to_championship(request):
         
         valid_championship_teams = [tid for tid in championship_team_ids if tid in contest_team_ids]
         non_championship_teams = [tid for tid in contest_team_ids if tid not in valid_championship_teams]
+
+        disqualified_team_ids = list(
+            Teams.objects.filter(id__in=valid_championship_teams)
+            .filter(Q(judge_disqualified=True) | Q(organizer_disqualified=True))
+            .values_list("id", flat=True)
+        )
+        if disqualified_team_ids:
+            return Response(
+                {
+                    "ok": False,
+                    "message": "Disqualified teams cannot advance to the championship round.",
+                    "team_ids": disqualified_team_ids,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         
         contest_clusters = MapContestToCluster.objects.filter(contestid=contest_id)
         championship_cluster = None
